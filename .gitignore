@@ -1,0 +1,36 @@
+# Local Python environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local secrets and configuration
+.env
+.env.*
+!.env.example
+
+# Raw trip data and generated datasets
+main/data/
+main/artifacts/
+*.csv
+*.csv_1
+*.parquet
+*.pkl
+
+# Streamlit and local runtime files
+.streamlit/secrets.toml
+*.log
+
+# Editors and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local support material
+Github_Repo_support/
