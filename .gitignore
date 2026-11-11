@@ -1,0 +1,29 @@
+# Local environments and caches
+.venv/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Raw and uploaded datasets
+data/
+code/.uploaded_csv/
+code/processed/
+
+# Generated models and local application state
+code/models/
+code/*.sqlite
+code/*.db
+*.pkl
+
+# Local secrets and environment files
+.env
+.env.*
+!.env.example
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
