@@ -11,6 +11,7 @@ env/
 
 # Raw and generated datasets
 data/
+data_load/
 code/.uploaded_csv/
 code/processed/
 main/data/

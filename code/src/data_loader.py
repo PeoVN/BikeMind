@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import gc
 import json
 import logging
+import os
+import re
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -37,6 +40,26 @@ CORE_TRIP_DTYPES = {
     "end station name": "category",
     "end station latitude": "float32",
     "end station longitude": "float32",
+}
+
+NORMALIZED_FIELD_ALIASES = {
+    "tripduration": {"tripduration", "trip duration", "trip_duration", "duration"},
+    "starttime": {"starttime", "start time", "start_time", "started at", "started_at"},
+    "stoptime": {"stoptime", "stop time", "stop_time", "ended at", "ended_at"},
+    "start station id": {"start station id", "start_station_id"},
+    "start station name": {"start station name", "start_station_name"},
+    "start station latitude": {"start station latitude", "start_station_latitude", "start lat", "start_lat"},
+    "start station longitude": {
+        "start station longitude", "start_station_longitude", "start lng", "start_lng",
+        "start lon", "start_lon",
+    },
+    "end station id": {"end station id", "end_station_id"},
+    "end station name": {"end station name", "end_station_name"},
+    "end station latitude": {"end station latitude", "end_station_latitude", "end lat", "end_lat"},
+    "end station longitude": {
+        "end station longitude", "end_station_longitude", "end lng", "end_lng",
+        "end lon", "end_lon",
+    },
 }
 
 
@@ -84,6 +107,57 @@ def _default_data_directory() -> Path:
 
 def _is_ignored_path(path: Path) -> bool:
     return any(part.lower() == "__macosx" or part.startswith("._") for part in path.parts)
+
+
+def has_core_trip_columns(path: Path) -> bool:
+    """Check the legacy Citi Bike schema before building the DuckDB query."""
+    try:
+        with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as stream:
+            columns = {column.strip().lower() for column in next(csv.reader(stream))}
+    except (OSError, StopIteration, csv.Error):
+        return False
+    return set(CORE_TRIP_COLUMNS).issubset(columns)
+
+
+def _header_key(value: str) -> str:
+    return re.sub(r"[\s_]+", " ", value.strip().lower())
+
+
+def build_normalization_plan(path: Path) -> tuple[dict[str, str], str | None]:
+    """Map a supported CSV header to the legacy fields without changing the file."""
+    try:
+        with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as stream:
+            headers = next(csv.reader(stream))
+    except (OSError, StopIteration, csv.Error):
+        return {}, "Không thể đọc dòng tiêu đề của file CSV."
+
+    available = {_header_key(header): header for header in headers if str(header).strip()}
+    plan: dict[str, str] = {}
+    for field, aliases in NORMALIZED_FIELD_ALIASES.items():
+        for alias in aliases:
+            header = available.get(_header_key(alias))
+            if header is not None:
+                plan[field] = header
+                break
+
+    required = [
+        "starttime",
+        "stoptime",
+        "start station id",
+        "start station name",
+        "start station latitude",
+        "start station longitude",
+        "end station id",
+        "end station name",
+        "end station latitude",
+        "end station longitude",
+    ]
+    missing = [field for field in required if field not in plan]
+    if "tripduration" not in plan and not {"starttime", "stoptime"}.issubset(plan):
+        missing.append("tripduration hoặc cặp started_at/ended_at")
+    if missing:
+        return {}, "Thiếu cột bắt buộc sau khi chuẩn hóa: " + ", ".join(missing) + "."
+    return plan, None
 
 
 def scan_and_load_unique_csv(
@@ -196,31 +270,86 @@ def scan_and_prepare_unique_csv(
         path for path in base_path.rglob("*.csv")
         if path.is_file() and not _is_ignored_path(path) and path.stat().st_size > 0
     ] if base_path.exists() else []
-    stats = {"total": len(candidates), "unique": 0, "dup_files": 0, "dup_rows": 0}
-    seen_hashes: set[str] = set()
-    unique_paths: list[Path] = []
-    file_hashes: dict[Path, str] = {}
-    for index, path in enumerate(sorted(candidates), start=1):
-        digest = calculate_file_hash(path)
-        if digest and digest not in seen_hashes:
-            seen_hashes.add(digest)
-            file_hashes[path] = digest
-            unique_paths.append(path)
-            stats["unique"] += 1
-        elif digest:
-            stats["dup_files"] += 1
-        if progress_callback is not None:
-            progress_callback(index, len(candidates), f"Đã kiểm tra MD5: {path.name}", 0)
-    if not unique_paths:
-        return pd.DataFrame(columns=CORE_TRIP_COLUMNS), stats, 0, 0
-
     manifest_path = output_path / "uc1_loaded_csv_files.json"
+    rejected_path = output_path / "uc1_rejected_csv_files.json"
     previous_manifest: list[dict[str, object]] = []
     if manifest_path.exists():
         try:
             previous_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError):
             previous_manifest = []
+    previous_by_path = {
+        str(item["relative_path"]): item
+        for item in previous_manifest
+        if isinstance(item, dict) and item.get("relative_path")
+    }
+    stats = {"total": len(candidates), "unique": 0, "dup_files": 0, "dup_rows": 0}
+    seen_hashes: set[str] = set()
+    unique_paths: list[Path] = []
+    file_hashes: dict[Path, str] = {}
+    normalization_plans: dict[Path, dict[str, str]] = {}
+    rejected_files: list[dict[str, str]] = []
+    for index, path in enumerate(sorted(candidates), start=1):
+        normalization_plan, normalization_error = build_normalization_plan(path)
+        if normalization_error is not None:
+            logger.warning("Bỏ qua %s: %s", path, normalization_error)
+            rejected_files.append(
+                {
+                    "File": path.name,
+                    "Đường dẫn tương đối": str(path.relative_to(base_path)),
+                    "Lý do": normalization_error,
+                }
+            )
+            if progress_callback is not None:
+                progress_callback(index, len(candidates), f"Bỏ qua file không thể chuẩn hóa: {path.name}", 0)
+            continue
+        relative_path = str(path.relative_to(base_path))
+        file_stat = path.stat()
+        previous_item = previous_by_path.get(relative_path)
+        digest = ""
+        if (
+            previous_item is not None
+            and previous_item.get("size_bytes") == file_stat.st_size
+            and previous_item.get("modified_ns") == file_stat.st_mtime_ns
+        ):
+            digest = str(previous_item.get("md5", ""))
+        if not digest:
+            digest = calculate_file_hash(path)
+        if not digest:
+            rejected_files.append(
+                {
+                    "File": path.name,
+                    "Đường dẫn tương đối": relative_path,
+                    "Lý do": "Không thể đọc file để tính mã MD5.",
+                }
+            )
+            if progress_callback is not None:
+                progress_callback(index, len(candidates), f"Không thể đọc file: {path.name}", 0)
+            continue
+        if digest and digest not in seen_hashes:
+            seen_hashes.add(digest)
+            file_hashes[path] = digest
+            unique_paths.append(path)
+            normalization_plans[path] = normalization_plan
+            stats["unique"] += 1
+        elif digest:
+            stats["dup_files"] += 1
+            rejected_files.append(
+                {
+                    "File": path.name,
+                    "Đường dẫn tương đối": relative_path,
+                    "Lý do": "Trùng nội dung với một file CSV khác (MD5 giống nhau).",
+                }
+            )
+        if progress_callback is not None:
+            progress_callback(index, len(candidates), f"Đã kiểm tra MD5: {path.name}", 0)
+    rejected_path.write_text(
+        json.dumps(rejected_files, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    if not unique_paths:
+        return pd.DataFrame(columns=CORE_TRIP_COLUMNS), stats, 0, 0
+
     previous_hashes = {
         str(item["md5"])
         for item in previous_manifest
@@ -270,22 +399,40 @@ def scan_and_prepare_unique_csv(
     def sql_path(path: Path) -> str:
         return "'" + str(path.resolve()).replace("\\", "/").replace("'", "''") + "'"
 
-    file_list = "[" + ", ".join(sql_path(path) for path in incremental_paths) + "]"
-    normalized_csv_sql = f"""
-        SELECT
-            try_cast(tripduration AS INTEGER) AS tripduration,
-            try_cast(starttime AS TIMESTAMP) AS starttime,
-            try_cast(stoptime AS TIMESTAMP) AS stoptime,
-            try_cast("start station id" AS DOUBLE) AS "start station id",
-            CAST("start station name" AS VARCHAR) AS "start station name",
-            try_cast("start station latitude" AS DOUBLE) AS "start station latitude",
-            try_cast("start station longitude" AS DOUBLE) AS "start station longitude",
-            try_cast("end station id" AS DOUBLE) AS "end station id",
-            CAST("end station name" AS VARCHAR) AS "end station name",
-            try_cast("end station latitude" AS DOUBLE) AS "end station latitude",
-            try_cast("end station longitude" AS DOUBLE) AS "end station longitude"
-        FROM read_csv_auto({file_list}, union_by_name=true, ignore_errors=true, null_padding=true)
-    """
+    def sql_identifier(value: str) -> str:
+        return '"' + value.replace('"', '""') + '"'
+
+    def normalized_select(path: Path) -> str:
+        plan = normalization_plans[path]
+        source = f"read_csv_auto({sql_path(path)}, union_by_name=true, ignore_errors=true, null_padding=true)"
+        starttime = f"try_cast({sql_identifier(plan['starttime'])} AS TIMESTAMP)"
+        stoptime = f"try_cast({sql_identifier(plan['stoptime'])} AS TIMESTAMP)"
+        if "tripduration" in plan:
+            tripduration = f"try_cast({sql_identifier(plan['tripduration'])} AS INTEGER)"
+        else:
+            tripduration = f"date_diff('second', {starttime}, {stoptime})::INTEGER"
+        expressions = {
+            "tripduration": tripduration,
+            "starttime": starttime,
+            "stoptime": stoptime,
+            "start station id": f"try_cast({sql_identifier(plan['start station id'])} AS DOUBLE)",
+            "start station name": f"CAST({sql_identifier(plan['start station name'])} AS VARCHAR)",
+            "start station latitude": f"try_cast({sql_identifier(plan['start station latitude'])} AS DOUBLE)",
+            "start station longitude": f"try_cast({sql_identifier(plan['start station longitude'])} AS DOUBLE)",
+            "end station id": f"try_cast({sql_identifier(plan['end station id'])} AS DOUBLE)",
+            "end station name": f"CAST({sql_identifier(plan['end station name'])} AS VARCHAR)",
+            "end station latitude": f"try_cast({sql_identifier(plan['end station latitude'])} AS DOUBLE)",
+            "end station longitude": f"try_cast({sql_identifier(plan['end station longitude'])} AS DOUBLE)",
+        }
+        selected = ",\n".join(
+            f"{expression} AS {sql_identifier(field)}"
+            for field, expression in expressions.items()
+        )
+        return f"SELECT {selected} FROM {source}"
+
+    normalized_csv_sql = "\nUNION ALL\n".join(
+        normalized_select(path) for path in incremental_paths
+    )
     if can_increment:
         source_sql = f"""
             SELECT * FROM read_parquet({sql_path(trip_output)})
@@ -296,10 +443,12 @@ def scan_and_prepare_unique_csv(
         source_sql = normalized_csv_sql
     connection = duckdb.connect()
     try:
-        connection.execute("SET memory_limit='4GB'")
-        connection.execute("SET threads=2")
+        connection.execute("SET memory_limit='80%'")
+        connection.execute(f"SET threads={max(1, min(8, os.cpu_count() or 4))}")
         connection.execute("SET max_temp_directory_size='200GB'")
-        temp_directory = output_path / "duckdb_tmp"
+        temp_directory = Path(
+            os.environ.get("BIKEMIND_DUCKDB_TEMP_DIR", str(output_path / "duckdb_tmp"))
+        )
         temp_directory.mkdir(parents=True, exist_ok=True)
         connection.execute(f"SET temp_directory='{str(temp_directory).replace(chr(92), '/').replace(chr(39), chr(39) * 2)}'")
         connection.execute("SET preserve_insertion_order=false")
@@ -398,6 +547,8 @@ def scan_and_prepare_unique_csv(
                     "file": path.name,
                     "relative_path": str(path.relative_to(base_path)),
                     "md5": file_hashes[path],
+                    "size_bytes": file_stat.st_size,
+                    "modified_ns": file_stat.st_mtime_ns,
                     "size_mb": round(file_stat.st_size / (1024 * 1024), 2),
                     "modified_at": pd.Timestamp(file_stat.st_mtime, unit="s").isoformat(timespec="seconds"),
                 }

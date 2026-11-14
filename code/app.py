@@ -6,6 +6,8 @@ import hashlib
 import json
 import math
 import sqlite3
+import shutil
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -18,7 +20,13 @@ import streamlit.components.v1 as components
 from folium.plugins import Fullscreen
 from streamlit_folium import st_folium
 
-from src.data_cleaner import aggregate_hourly, build_station_metadata, clean_trips, save_processed
+from src.data_cleaner import (
+    aggregate_hourly,
+    build_station_metadata,
+    clean_trips,
+    process_and_build_parquet_grid,
+    save_processed,
+)
 from src.data_loader import (
     load_station_metadata,
     load_trip_data,
@@ -31,18 +39,23 @@ from src.data_loader import (
     scan_csv_files,
 )
 from src.feature_engineering import make_features, feature_columns
+from src.gbfs_collector import run_gbfs_collector_job
 from src.model_trainer import load_model, train_models
 from src.rebalancing_engine import generate_rebalancing_plan
 
 
 ROOT = Path(__file__).resolve().parent
+DATA_DIRECTORY = ROOT.parent / "data"
+DATA_LOAD_DIRECTORY = ROOT.parent / "data_load"
 PROCESSED = ROOT / "processed"
 MODELS = ROOT / "models"
 DB_PATH = ROOT / "bikemind_decisions.sqlite"
 UC1_DATA_PATH = PROCESSED / "uc1_loaded_trips.parquet"
+UC1_FULL_DATA_PATH = PROCESSED / "uc1_trips_deduplicated.parquet"
 UC1_DATA_CSV_PATH = PROCESSED / "uc1_loaded_trips.csv"
 UC1_STATS_PATH = PROCESSED / "uc1_load_stats.json"
 UC1_CSV_MANIFEST_PATH = PROCESSED / "uc1_loaded_csv_files.json"
+UC1_REJECTED_CSV_PATH = PROCESSED / "uc1_rejected_csv_files.json"
 
 
 def _demo_data() -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -86,8 +99,11 @@ def load_dashboard_data() -> tuple[pd.DataFrame, pd.DataFrame, str]:
     else:
         hourly = pd.DataFrame()
     if hourly.empty or stations.empty:
-        hourly, stations = _demo_data()
-        return hourly, stations, "Demo data (processed files chưa có)"
+        return (
+            pd.DataFrame(columns=["timestamp", "station_id", "pickups", "returns"]),
+            pd.DataFrame(columns=["station_id", "station_name", "lat", "lon", "capacity"]),
+            "Không có dữ liệu",
+        )
     hourly["timestamp"] = pd.to_datetime(hourly["timestamp"])
     stations["station_id"] = stations["station_id"].astype(str)
     hourly["station_id"] = hourly["station_id"].astype(str)
@@ -97,6 +113,17 @@ def load_dashboard_data() -> tuple[pd.DataFrame, pd.DataFrame, str]:
 def build_data_status(hourly: pd.DataFrame, stations: pd.DataFrame, data_source: str) -> dict[str, str]:
     """Build a transparent, human-readable description of dashboard inputs."""
     is_demo = data_source.startswith("Demo")
+    if data_source == "Không có dữ liệu":
+        return {
+            "mode": "KHÔNG CÓ DỮ LIỆU",
+            "source": "Không có dữ liệu",
+            "hourly_rows": "Không có dữ liệu",
+            "station_rows": "Không có dữ liệu",
+            "time_range": "Không có dữ liệu",
+            "hourly_files": "Không có dữ liệu",
+            "station_files": "Không có dữ liệu",
+            "models": "Không có dữ liệu",
+        }
     hourly_files = [
         path for path in (PROCESSED / "station_hour_cleaned.parquet", PROCESSED / "station_hour_cleaned.csv")
         if path.exists()
@@ -133,21 +160,15 @@ def build_data_status(hourly: pd.DataFrame, stations: pd.DataFrame, data_source:
 def list_project_csv_files(loaded_only: bool = False) -> pd.DataFrame:
     """List eligible raw CSV files, optionally limited to the latest load."""
     columns = ["File", "Đường dẫn tương đối", "Dung lượng (MB)", "Cập nhật lần cuối"]
+    data_directory = DATA_LOAD_DIRECTORY if loaded_only else DATA_DIRECTORY
+    manifest_by_path: dict[str, dict[str, object]] = {}
     if loaded_only and UC1_CSV_MANIFEST_PATH.exists():
         manifest = json.loads(UC1_CSV_MANIFEST_PATH.read_text(encoding="utf-8"))
-        return pd.DataFrame(
-            [
-                {
-                    "File": item["file"],
-                    "Đường dẫn tương đối": item["relative_path"],
-                    "Dung lượng (MB)": item["size_mb"],
-                    "Cập nhật lần cuối": item["modified_at"],
-                }
-                for item in manifest
-            ],
-            columns=columns,
-        )
-    data_directory = ROOT.parent / "data"
+        manifest_by_path = {
+            str(item["relative_path"]): item
+            for item in manifest
+            if isinstance(item, dict) and item.get("relative_path")
+        }
     rows: list[dict[str, object]] = []
     if not data_directory.exists():
         return pd.DataFrame(columns=columns)
@@ -155,15 +176,141 @@ def list_project_csv_files(loaded_only: bool = False) -> pd.DataFrame:
         if not path.is_file() or "__macosx" in {part.lower() for part in path.parts} or path.name.startswith("._"):
             continue
         stat = path.stat()
+        relative_path = str(path.relative_to(data_directory))
+        manifest_item = manifest_by_path.get(relative_path)
         rows.append(
             {
                 "File": path.name,
-                "Đường dẫn tương đối": str(path.relative_to(data_directory)),
-                "Dung lượng (MB)": round(stat.st_size / (1024 * 1024), 2),
-                "Cập nhật lần cuối": datetime.fromtimestamp(stat.st_mtime).strftime("%d/%m/%Y %H:%M:%S"),
+                "Đường dẫn tương đối": relative_path,
+                "Dung lượng (MB)": manifest_item.get("size_mb", round(stat.st_size / (1024 * 1024), 2))
+                if manifest_item else round(stat.st_size / (1024 * 1024), 2),
+                "Cập nhật lần cuối": manifest_item.get("modified_at")
+                if manifest_item
+                else datetime.fromtimestamp(stat.st_mtime).strftime("%d/%m/%Y %H:%M:%S"),
             }
         )
     return pd.DataFrame(rows)
+
+
+def copy_csv_files_to_load_directory() -> int:
+    """Copy source CSVs to data_load while preserving their relative paths."""
+    if not DATA_DIRECTORY.exists():
+        raise FileNotFoundError(f"Không tìm thấy thư mục dữ liệu gốc: {DATA_DIRECTORY}")
+    DATA_LOAD_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    copied_count = 0
+    for source_path in sorted(DATA_DIRECTORY.rglob("*.csv")):
+        if (
+            not source_path.is_file()
+            or "__macosx" in {part.lower() for part in source_path.parts}
+            or source_path.name.startswith("._")
+        ):
+            continue
+        relative_path = source_path.relative_to(DATA_DIRECTORY)
+        destination = DATA_LOAD_DIRECTORY / relative_path
+        source_stat = source_path.stat()
+        destination_stat = destination.stat() if destination.exists() else None
+        if (
+            destination_stat is not None
+            and destination_stat.st_size == source_stat.st_size
+            and destination_stat.st_mtime_ns == source_stat.st_mtime_ns
+        ):
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, destination)
+        copied_count += 1
+    return copied_count
+
+
+def delete_loaded_csv_files(relative_paths: list[str]) -> tuple[int, int, list[str]]:
+    """Delete selected loaded CSVs from data_load/ and update the load manifest."""
+    if not relative_paths:
+        return 0, 0, []
+    manifest: list[dict[str, object]] = []
+    if UC1_CSV_MANIFEST_PATH.exists():
+        manifest = json.loads(UC1_CSV_MANIFEST_PATH.read_text(encoding="utf-8"))
+    selected_paths = set(relative_paths)
+    manifest_paths = {
+        str(item.get("relative_path", ""))
+        for item in manifest
+        if isinstance(item, dict)
+    }
+    manifest.extend(
+        {"relative_path": relative_path}
+        for relative_path in selected_paths - manifest_paths
+    )
+    data_directory = DATA_LOAD_DIRECTORY.resolve()
+    if not data_directory.exists():
+        raise FileNotFoundError(f"Không tìm thấy thư mục dữ liệu đã load: {data_directory}")
+
+    remaining: list[dict[str, object]] = []
+    deleted_count = 0
+    missing_count = 0
+    failed_paths: list[str] = []
+    for item in manifest:
+        relative_path = str(item.get("relative_path", ""))
+        if relative_path not in selected_paths:
+            remaining.append(item)
+            continue
+        candidate = (data_directory / relative_path).resolve()
+        try:
+            candidate.relative_to(data_directory)
+        except ValueError as exc:
+            raise ValueError(f"Đường dẫn file không hợp lệ: {relative_path}") from exc
+        if candidate.suffix.lower() != ".csv":
+            raise ValueError(f"Chỉ được xóa file CSV: {relative_path}")
+        if candidate.exists():
+            deleted = False
+            for attempt in range(3):
+                try:
+                    candidate.unlink()
+                    deleted = True
+                    deleted_count += 1
+                    break
+                except PermissionError:
+                    if attempt < 2:
+                        time.sleep(0.5)
+            if not deleted:
+                remaining.append(item)
+                failed_paths.append(relative_path)
+        else:
+            missing_count += 1
+
+    UC1_CSV_MANIFEST_PATH.write_text(
+        json.dumps(remaining, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    if UC1_REJECTED_CSV_PATH.exists():
+        rejected = json.loads(UC1_REJECTED_CSV_PATH.read_text(encoding="utf-8"))
+        rejected = [
+            item for item in rejected
+            if str(item.get("Đường dẫn tương đối", "")) not in selected_paths
+        ]
+        UC1_REJECTED_CSV_PATH.write_text(
+            json.dumps(rejected, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    return deleted_count, missing_count, failed_paths
+
+
+def clear_loaded_data_artifacts() -> None:
+    """Invalidate derived data after loaded source files are removed."""
+    artifact_paths = [
+        PROCESSED / "station_hour_cleaned.parquet",
+        PROCESSED / "station_hour_cleaned.csv",
+        PROCESSED / "station_hour_events.parquet",
+        PROCESSED / "station_metadata.parquet",
+        PROCESSED / "station_metadata.csv",
+        PROCESSED / "uc1_trips_deduplicated.parquet",
+        UC1_DATA_PATH,
+        UC1_DATA_CSV_PATH,
+        UC1_STATS_PATH,
+        MODELS / "lgb_pickups.pkl",
+        MODELS / "lgb_returns.pkl",
+    ]
+    for path in artifact_paths:
+        if path.exists():
+            path.unlink()
+    load_dashboard_data.clear()
 
 
 def render_data_status(status: dict[str, str], location: str) -> None:
@@ -198,6 +345,13 @@ def render_data_status(status: dict[str, str], location: str) -> None:
 
 
 def _station_snapshot(hourly: pd.DataFrame, stations: pd.DataFrame, timestamp: pd.Timestamp) -> pd.DataFrame:
+    if stations.empty:
+        return pd.DataFrame(
+            columns=[
+                "station_id", "station_name", "lat", "lon", "capacity",
+                "pickups", "returns", "bikes_available", "utilization", "status",
+            ]
+        )
     latest = hourly.copy()
     if "timestamp" not in latest or "station_id" not in latest:
         latest = pd.DataFrame(columns=["station_id", "pickups", "returns", "timestamp"])
@@ -239,7 +393,12 @@ def render_map(snapshot: pd.DataFrame, plan: pd.DataFrame | None = None, height:
                             fill=True, fill_color=_status_color(row["status"]), fill_opacity=0.9,
                             tooltip=f"{row['station_name']} · {row['status']}", popup=popup).add_to(fmap)
     if plan is not None and not plan.empty:
-        lookup = snapshot.set_index("station_name")[["lat", "lon"]].to_dict("index")
+        lookup = (
+            snapshot
+            .drop_duplicates(subset=["station_name"], keep="last")
+            .set_index("station_name")[["lat", "lon"]]
+            .to_dict("index")
+        )
         for row in plan.to_dict("records"):
             if row["from_station"] in lookup and row["to_station"] in lookup:
                 folium.PolyLine([(lookup[row["from_station"]]["lat"], lookup[row["from_station"]]["lon"]),
@@ -532,6 +691,8 @@ def main() -> None:
     restore_uc1_result()
     data_status = build_data_status(hourly, stations, data_source)
     latest = pd.to_datetime(hourly["timestamp"]).max()
+    if pd.isna(latest):
+        latest = pd.Timestamp.now().floor("h")
     with st.sidebar:
         st.markdown("## 🚲 BikeMind")
         st.caption("Smart Mobility · DSS for Public Bicycle Rebalancing")
@@ -558,7 +719,8 @@ def main() -> None:
         c1, c2, c3, c4 = st.columns(4)
         with c1: metric_card("Tổng trạm", f"{len(snapshot)}", "Mạng lưới đang giám sát")
         with c2: metric_card("Xe khả dụng", f"{snapshot.bikes_available.sum():,.0f}", "Tổng inventory", "#22C55E")
-        with c3: metric_card("Tỷ lệ cân bằng", f"{(snapshot.status == 'Cân bằng').mean():.0%}", "Mục tiêu > 70%", "#38BDF8")
+        balance_rate = 0 if snapshot.empty else (snapshot.status == "Cân bằng").mean()
+        with c3: metric_card("Tỷ lệ cân bằng", f"{balance_rate:.0%}", "Mục tiêu > 70%", "#38BDF8")
         with c4: metric_card("Cảnh báo", f"{(snapshot.status != 'Cân bằng').sum()}", "Cần hành động", "#F59E0B")
         left, right = st.columns([2.1, 1])
         with left: render_map(snapshot)
@@ -569,13 +731,18 @@ def main() -> None:
                 columns={"station_name": "Trạm", "bikes_available": "Xe", "capacity": "Sức chứa", "status": "Trạng thái"}),
                 hide_index=True, use_container_width=True)
     with tabs[1]:
-        chosen = st.selectbox("Chọn trạm", stations["station_name"].tolist())
-        station_id = str(stations.loc[stations["station_name"] == chosen, "station_id"].iloc[0])
-        forecast_chart(hourly, station_id, pd.Timestamp(selected_date))
+        if stations.empty:
+            st.info("Không có dữ liệu")
+        else:
+            chosen = st.selectbox("Chọn trạm", stations["station_name"].tolist())
+            station_id = str(stations.loc[stations["station_name"] == chosen, "station_id"].iloc[0])
+            forecast_chart(hourly, station_id, pd.Timestamp(selected_date))
     with tabs[2]:
         plan = generate_rebalancing_plan(snapshot, safety_buffer=safety)
         st.subheader("Lịch trình xe tải · Gom → Rải")
-        if plan.empty:
+        if snapshot.empty:
+            st.info("Không có dữ liệu")
+        elif plan.empty:
             st.success("Mạng lưới hiện cân bằng, chưa cần điều phối.")
         else:
             a, b = st.columns([1.5, 1])
@@ -592,21 +759,21 @@ def main() -> None:
     with tabs[3]:
         st.subheader("⚙️ Quản trị Backend & AI")
         render_data_status(data_status, "tab")
-        left, right = st.columns(2)
-        with left:
+        pipeline_tabs = st.tabs(["Quản trị Pipeline Dữ liệu", "Use Case 2 · Tiền xử lý dữ liệu"])
+        with pipeline_tabs[0]:
             st.markdown("#### Quản trị Pipeline Dữ liệu")
             if st.session_state.get("uc1_activation_message"):
                 st.success(st.session_state["uc1_activation_message"])
             with st.expander("📁 Danh sách toàn bộ file CSV đang sử dụng", expanded=False):
                 csv_inventory = list_project_csv_files(loaded_only=True)
                 if csv_inventory.empty:
-                    st.info("Không tìm thấy file CSV hợp lệ trong thư mục data/.")
+                    st.info("Không tìm thấy file CSV hợp lệ trong thư mục data_load/.")
                 else:
                     total_size = csv_inventory["Dung lượng (MB)"].sum()
                     st.caption(
                         f"Tìm thấy **{len(csv_inventory):,} file CSV** · "
                         f"Tổng dung lượng **{total_size:,.2f} MB** · "
-                        "Danh sách được đọc từ thư mục data/"
+                        "Danh sách được đọc từ thư mục data_load/"
                     )
                     st.dataframe(
                         csv_inventory,
@@ -614,39 +781,97 @@ def main() -> None:
                         use_container_width=True,
                         height=320,
                     )
-            selected_directory_files = st.file_uploader(
-                "Chọn thư mục dữ liệu CSV để Load Data",
-                type=["csv"],
-                accept_multiple_files="directory",
-                help="Chọn một thư mục chứa các file CSV cần nạp vào dashboard.",
-                key="load_data_directory",
-            )
-            filtered_directory_files: list = []
-            skipped_extensions = 0
-            skipped_duplicates = 0
-            if selected_directory_files:
-                (
-                    filtered_directory_files,
-                    skipped_extensions,
-                    skipped_duplicates,
-                ) = filter_uploaded_csv_files(selected_directory_files)
-                st.caption(
-                    f"Đã chọn {len(selected_directory_files):,} file · "
-                    f"Giữ lại {len(filtered_directory_files):,} file CSV độc nhất"
-                )
-                if skipped_duplicates or skipped_extensions:
-                    st.info(
-                        f"Đã loại trước khi Load Data: {skipped_duplicates:,} file trùng MD5, "
-                        f"{skipped_extensions:,} file không phải CSV."
+            with st.expander("⚠️ Danh sách file CSV không sử dụng được", expanded=False):
+                if UC1_REJECTED_CSV_PATH.exists():
+                    try:
+                        rejected_csv = json.loads(UC1_REJECTED_CSV_PATH.read_text(encoding="utf-8"))
+                    except (OSError, ValueError, TypeError):
+                        rejected_csv = []
+                    if rejected_csv:
+                        st.warning(
+                            f"Có **{len(rejected_csv):,} file CSV không được đưa vào xử lý."
+                        )
+                        rejected_columns = ["File", "Lý do", "Đường dẫn tương đối"]
+                        rejected_frame = pd.DataFrame(rejected_csv)
+                        if "Lý do" not in rejected_frame.columns:
+                            rejected_frame["Lý do"] = (
+                                "Chưa được ghi nhận ở lần Load Data trước; "
+                                "hãy Load Data lại để xác định nguyên nhân."
+                            )
+                        for column in rejected_columns:
+                            if column not in rejected_frame.columns:
+                                rejected_frame[column] = "Không có thông tin"
+                        st.dataframe(
+                            rejected_frame[rejected_columns],
+                            hide_index=True,
+                            use_container_width=True,
+                            height=320,
+                        )
+                    else:
+                        st.info("Không có file CSV nào bị loại khỏi quá trình xử lý.")
+                else:
+                    st.info("Chưa có thông tin file CSV không sử dụng được.")
+            with st.expander("🗑️ Xóa file CSV đã load", expanded=False):
+                loaded_csv_inventory = list_project_csv_files(loaded_only=True)
+                if loaded_csv_inventory.empty:
+                    st.info("Không có file CSV đã load để xóa.")
+                else:
+                    loaded_csv_paths = loaded_csv_inventory["Đường dẫn tương đối"].tolist()
+                    selected_csv_paths = st.multiselect(
+                        "Chọn các file CSV muốn xóa khỏi thư mục data_load/",
+                        options=loaded_csv_paths,
+                        key="delete_loaded_csv_paths",
                     )
+                    if selected_csv_paths:
+                        st.warning(
+                            f"Bạn đang chọn **{len(selected_csv_paths):,} file**. "
+                            "Thao tác này sẽ xóa file khỏi máy và không thể hoàn tác."
+                        )
+                        confirm_delete = st.checkbox(
+                            "Tôi xác nhận muốn xóa các file CSV đã chọn.",
+                            key="confirm_delete_loaded_csv",
+                        )
+                        if st.button(
+                            "🗑️ Xác nhận xóa file đã chọn",
+                            type="secondary",
+                            disabled=not confirm_delete,
+                            key="delete_selected_loaded_csv",
+                            use_container_width=True,
+                        ):
+                            try:
+                                deleted_count, missing_count, failed_paths = delete_loaded_csv_files(selected_csv_paths)
+                                if deleted_count or missing_count:
+                                    clear_loaded_data_artifacts()
+                                    st.session_state.pop("uc1_loaded_data", None)
+                                    st.session_state.pop("uc1_load_stats", None)
+                                    st.session_state.pop("uc1_activation_message", None)
+                            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                                st.error(f"Không thể xóa file CSV đã chọn: {exc}")
+                            else:
+                                list_project_csv_files.clear()
+                                message = f"Đã xóa {deleted_count:,} file CSV khỏi thư mục data_load/."
+                                if missing_count:
+                                    message += f" {missing_count:,} file không còn tồn tại nên chỉ được loại khỏi danh sách."
+                                if failed_paths:
+                                    st.warning(
+                                        f"{message} Không thể xóa {len(failed_paths):,} file đang được sử dụng. "
+                                        "Hãy đóng tiến trình đang mở file rồi thử lại."
+                                    )
+                                    st.caption("File chưa xóa: " + ", ".join(failed_paths[:3]))
+                                else:
+                                    st.success(message)
+                                    st.rerun()
+            st.caption(
+                f"Nguồn gốc: `{DATA_DIRECTORY}` · "
+                f"bản sao load: `{DATA_LOAD_DIRECTORY}` · chỉ quét các file `.csv`"
+            )
             load_data_clicked = st.button(
                 "📥 Load Data",
                 type="primary",
                 key="uc1_load_data",
                 use_container_width=True,
             )
-            if load_data_clicked and filtered_directory_files:
-                selected_directory = save_uploaded_directory(filtered_directory_files)
+            if load_data_clicked:
                 progress_bar = st.progress(0, text="Đang chuẩn bị nạp dữ liệu...")
                 progress_text = st.empty()
 
@@ -658,12 +883,17 @@ def main() -> None:
                     )
                     progress_text.caption(f"{message} | Đã nạp tạm: {loaded_rows:,} dòng")
 
-                with st.spinner("Đang quét đệ quy thư mục data, tính toán mã MD5, khử trùng file và nạp dữ liệu..."):
-                    loaded_data, load_stats, activated_hourly_count, activated_station_count = scan_and_prepare_unique_csv(
-                        base_directory=selected_directory,
-                        output_directory=PROCESSED,
-                        progress_callback=update_load_progress,
-                    )
+                try:
+                    copy_csv_files_to_load_directory()
+                    with st.spinner("Đang sao chép và quét dữ liệu CSV, tính toán mã MD5, khử trùng file và nạp dữ liệu..."):
+                        loaded_data, load_stats, activated_hourly_count, activated_station_count = scan_and_prepare_unique_csv(
+                            base_directory=DATA_LOAD_DIRECTORY,
+                            output_directory=PROCESSED,
+                            progress_callback=update_load_progress,
+                        )
+                except (OSError, RuntimeError, ValueError) as exc:
+                    st.error(f"Không thể sao chép hoặc xử lý dữ liệu CSV: {exc}")
+                    st.stop()
                 load_dashboard_data.clear()
                 list_project_csv_files.clear()
                 progress_bar.progress(1.0, text="Hoàn tất Use Case 1 · 100%")
@@ -686,8 +916,6 @@ def main() -> None:
                     f"bộ dữ liệu hợp nhất có {load_stats.get('row_count', len(loaded_data)):,} chuyến đi."
                 )
                 st.rerun()
-            elif load_data_clicked:
-                st.info("Vui lòng chọn thư mục chứa file CSV trước khi bấm Load Data.")
             if "uc1_load_stats" in st.session_state:
                 load_stats = st.session_state["uc1_load_stats"]
                 loaded_data = st.session_state["uc1_loaded_data"]
@@ -710,28 +938,13 @@ def main() -> None:
                         )
                     st.dataframe(loaded_data.head(5), hide_index=True, use_container_width=True)
                 else:
-                    st.error("Không tìm thấy dữ liệu hợp lệ trong thư mục data/. Vui lòng kiểm tra lại đường dẫn!")
-            st.divider()
-            run_pipeline_clicked = st.button(
-                "📥 Load Data từ thư mục đã chọn",
-                use_container_width=True,
-                key="run_data_cleaning_pipeline",
-            )
-            if run_pipeline_clicked and filtered_directory_files:
-                try:
-                    with st.status("Đang chạy pipeline...", expanded=True) as status:
-                        new_hourly, new_stations, message = run_pipeline(filtered_directory_files)
-                        st.write("✓ Scan & MD5 dedup")
-                        st.write("✓ Lọc duration 60s–7200s và false-start")
-                        st.write("✓ Zero-filling station × hour 24/7")
-                        status.update(label=message, state="complete")
-                    st.rerun()
-                except (OSError, RuntimeError, ValueError) as exc:
-                    st.error(f"Không thể xử lý file CSV đã upload: {exc}")
-            elif run_pipeline_clicked:
-                st.info("Vui lòng chọn thư mục chứa file CSV trước khi bấm Load Data.")
-        with right:
-            if st.button("🧠 Retrain LightGBM Model", use_container_width=True):
+                    st.error("Không tìm thấy dữ liệu hợp lệ trong thư mục data_load/. Vui lòng kiểm tra lại đường dẫn!")
+            else:
+                st.info("Không có dữ liệu")
+        with pipeline_tabs[0]:
+            if data_source == "Không có dữ liệu":
+                st.info("Không có dữ liệu")
+            elif st.button("🧠 Retrain LightGBM Model", use_container_width=True):
                 with st.spinner("Chronological split 70/15/15 và huấn luyện..."):
                     try:
                         training_hourly = pd.read_parquet(PROCESSED / "station_hour_cleaned.parquet")
@@ -742,13 +955,98 @@ def main() -> None:
                         st.dataframe(pd.DataFrame(metrics).T, use_container_width=True)
                     except ValueError as exc:
                         st.error(str(exc))
-            benchmark = pd.DataFrame({"Model": ["Historical Average", "Seasonal Naive", "BikeMind LightGBM"],
-                                      "MAE": [4.82, 4.15, 3.08], "RMSE": [7.31, 6.42, 4.96], "WAPE": ["42.1%", "36.7%", "27.4%"]})
-            st.subheader("Benchmark")
-            st.dataframe(benchmark, hide_index=True, use_container_width=True)
+            if data_source == "Không có dữ liệu":
+                st.info("Không có dữ liệu")
+            else:
+                benchmark = pd.DataFrame({"Model": ["Historical Average", "Seasonal Naive", "BikeMind LightGBM"],
+                                          "MAE": [4.82, 4.15, 3.08], "RMSE": [7.31, 6.42, 4.96], "WAPE": ["42.1%", "36.7%", "27.4%"]})
+                st.subheader("Benchmark")
+                st.dataframe(benchmark, hide_index=True, use_container_width=True)
+        with pipeline_tabs[1]:
+            st.markdown("#### Use Case 2 · Tiền xử lý dữ liệu")
+            if st.button(
+                "🧹 Khởi chạy Data Cleaning & Zero-Filling Pipeline (Use Case 2)",
+                type="primary",
+                key="uc2_clean_data",
+                use_container_width=True,
+            ):
+                with st.spinner(
+                    "Đang đọc dữ liệu từ data_load/, lọc Outliers, trích xuất metadata "
+                    "trạm và phủ kín lưới 24/7 (Zero-Filling)..."
+                ):
+                    try:
+                        cleaned_hourly, cleaned_stations, cleaning_stats = (
+                            process_and_build_parquet_grid(
+                                input_directory=DATA_LOAD_DIRECTORY,
+                                output_directory=PROCESSED,
+                                input_parquet=UC1_FULL_DATA_PATH,
+                            )
+                        )
+                    except (OSError, ImportError, ValueError, TypeError) as exc:
+                        st.error(f"Không thể thực hiện Use Case 2: {exc}")
+                    else:
+                        load_dashboard_data.clear()
+                        st.success(
+                            "Đã hoàn tất làm sạch dữ liệu và tạo lưới thời gian 24/7 thành công!"
+                        )
+                        stat_columns = st.columns(3)
+                        stat_columns[0].metric(
+                            "Tổng số trạm đã chuẩn hóa",
+                            f"{cleaning_stats['station_count']:,}",
+                        )
+                        stat_columns[1].metric(
+                            "Bản ghi Station-Hour",
+                            f"{cleaning_stats['station_hour_rows']:,}",
+                        )
+                        stat_columns[2].metric(
+                            "Bản ghi bị loại",
+                            f"{cleaning_stats['removed_rows']:,}",
+                        )
+                        st.dataframe(
+                            cleaned_hourly.head(5),
+                            hide_index=True,
+                            use_container_width=True,
+                        )
+            st.markdown("#### Use Case 3 · GBFS Station Status Collector")
+            if st.button(
+                "🛰️ Kết nối GBFS & Thu thập Snapshot Trạm (Use Case 3)",
+                type="primary",
+                key="uc3_collect_gbfs",
+                use_container_width=True,
+            ):
+                with st.spinner(
+                    "Đang kết nối tới API GBFS công khai để lấy trạng thái tồn kho trạm thời gian thực..."
+                ):
+                    collector_result = run_gbfs_collector_job(DB_PATH)
+                if collector_result["success"]:
+                    st.success(
+                        "Đã thu thập và lưu trữ snapshot trạng thái trạm vào SQLite thành công!"
+                    )
+                    snapshot_data = collector_result["status_df"]
+                    metric_columns = st.columns(2)
+                    metric_columns[0].metric(
+                        "Tổng số trạm đã cập nhật",
+                        f"{collector_result['records_count']:,}",
+                    )
+                    metric_columns[1].metric(
+                        "Thời điểm ghi nhận",
+                        str(collector_result["timestamp"]),
+                    )
+                    st.dataframe(
+                        snapshot_data.head(10),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+                else:
+                    st.error(
+                        f"{collector_result['message']} "
+                        "Vui lòng kiểm tra kết nối mạng, endpoint GBFS và quyền ghi file SQLite."
+                    )
     with tabs[4]:
         st.subheader("Historical Backtesting")
-        if st.button("▶ Chạy mô phỏng lịch sử", type="primary"):
+        if hourly.empty or stations.empty:
+            st.info("Không có dữ liệu")
+        elif st.button("▶ Chạy mô phỏng lịch sử", type="primary"):
             total = query_hourly_total(PROCESSED) if not data_source.startswith("Demo") else float(hourly["pickups"].sum())
             scenario = pd.DataFrame({"Metric": ["Unmet Demand", "Empty/Full events", "Truck distance (km)"],
                                      "Scenario A · Thụ động": [total * 0.14, len(snapshot) * 2.4, 0],
