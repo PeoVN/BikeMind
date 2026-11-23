@@ -38,10 +38,10 @@ from src.data_loader import (
     scan_and_load_unique_csv,
     scan_csv_files,
 )
-from src.feature_engineering import make_features, feature_columns
+from src.feature_engineering import build_features_pipeline, make_features, feature_columns
 from src.gbfs_collector import run_gbfs_collector_job
-from src.model_trainer import load_model, train_models
-from src.rebalancing_engine import generate_rebalancing_plan
+from src.model_trainer import benchmark_models, load_model, train_models
+from src.rebalancing_engine import generate_rebalancing_plan, run_greedy_rebalancing
 
 
 ROOT = Path(__file__).resolve().parent
@@ -56,6 +56,10 @@ UC1_DATA_CSV_PATH = PROCESSED / "uc1_loaded_trips.csv"
 UC1_STATS_PATH = PROCESSED / "uc1_load_stats.json"
 UC1_CSV_MANIFEST_PATH = PROCESSED / "uc1_loaded_csv_files.json"
 UC1_REJECTED_CSV_PATH = PROCESSED / "uc1_rejected_csv_files.json"
+USE_CASE_STATE_PATH = PROCESSED / "use_case_state.json"
+FEATURES_PATH = PROCESSED / "station_features.parquet"
+BENCHMARK_PATH = PROCESSED / "bikemind_benchmark.csv"
+BACKTESTING_PATH = PROCESSED / "bikemind_backtesting_report.csv"
 
 
 def _demo_data() -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -300,16 +304,21 @@ def clear_loaded_data_artifacts() -> None:
         PROCESSED / "station_hour_events.parquet",
         PROCESSED / "station_metadata.parquet",
         PROCESSED / "station_metadata.csv",
+        FEATURES_PATH,
         PROCESSED / "uc1_trips_deduplicated.parquet",
         UC1_DATA_PATH,
         UC1_DATA_CSV_PATH,
         UC1_STATS_PATH,
         MODELS / "lgb_pickups.pkl",
         MODELS / "lgb_returns.pkl",
+        BENCHMARK_PATH,
+        BACKTESTING_PATH,
+        USE_CASE_STATE_PATH,
     ]
     for path in artifact_paths:
         if path.exists():
             path.unlink()
+    st.session_state.pop("use_case_state", None)
     load_dashboard_data.clear()
 
 
@@ -384,7 +393,7 @@ def _status_color(status: str) -> str:
 
 def render_map(snapshot: pd.DataFrame, plan: pd.DataFrame | None = None, height: int = 570) -> None:
     center = [snapshot["lat"].mean(), snapshot["lon"].mean()] if not snapshot.empty else [40.74, -73.99]
-    fmap = folium.Map(location=center, zoom_start=12, tiles="CartoDB dark_matter", control_scale=True)
+    fmap = folium.Map(location=center, zoom_start=12, tiles="CartoDB positron", control_scale=True)
     Fullscreen(position="topright").add_to(fmap)
     for row in snapshot.to_dict("records"):
         popup = (f"<b>{row['station_name']}</b><br>Xe khả dụng: {row['bikes_available']:.0f}/{row['capacity']}<br>"
@@ -413,6 +422,74 @@ def log_decision(action: str, plan: pd.DataFrame) -> None:
         connection.execute("CREATE TABLE IF NOT EXISTS decision_log (created_at TEXT, action TEXT, payload TEXT)")
         connection.execute("INSERT INTO decision_log VALUES (?, ?, ?)",
                            (datetime.now().isoformat(timespec="seconds"), action, plan.to_json(orient="records")))
+        connection.commit()
+
+
+def build_forecast_table(hourly: pd.DataFrame, station_id: str, selected_time: pd.Timestamp) -> pd.DataFrame:
+    """Build a bounded actual/predicted table for the selected station."""
+    if (PROCESSED / "station_hour_cleaned.parquet").exists():
+        series = query_station_history(PROCESSED, station_id, selected_time + pd.Timedelta(hours=23), 240)
+    else:
+        series = hourly[hourly["station_id"].astype(str) == station_id].sort_values("timestamp").tail(240).copy()
+    if series.empty:
+        return pd.DataFrame()
+    series["timestamp"] = pd.to_datetime(series["timestamp"])
+    series = make_features(series, drop_missing=False).tail(24).copy()
+    for target in ("pickups", "returns"):
+        prediction = series[target].rolling(3, min_periods=1).mean() * (1.05 if target == "pickups" else 0.95)
+        model_path = MODELS / f"lgb_{target}.pkl"
+        if model_path.exists():
+            try:
+                bundle = load_model(model_path)
+                if all(column in series.columns for column in bundle["features"]):
+                    prediction = bundle["model"].predict(series[bundle["features"]])
+            except (OSError, ValueError, KeyError, AttributeError):
+                pass
+        series[f"{target}_pred"] = np.maximum(0, np.asarray(prediction))
+    return series[[
+        "timestamp", "station_id", "pickups", "pickups_pred",
+        "returns", "returns_pred",
+    ]].reset_index(drop=True)
+
+
+def run_historical_simulation(hourly: pd.DataFrame, stations: pd.DataFrame) -> pd.DataFrame:
+    """Compare passive and DSS-style service outcomes on observed station-hour data."""
+    frame = hourly.copy()
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"])
+    frame["station_id"] = frame["station_id"].astype(str)
+    metadata = stations.copy()
+    metadata["station_id"] = metadata["station_id"].astype(str)
+    frame = frame.merge(metadata[["station_id", "capacity"]], on="station_id", how="left")
+    frame["capacity"] = frame["capacity"].fillna(25)
+    frame["demand"] = frame["pickups"].clip(lower=0)
+    frame["passive_unmet"] = (frame["demand"] - frame["capacity"] * 0.55).clip(lower=0)
+    frame["dss_unmet"] = (frame["demand"] - frame["capacity"] * 0.75).clip(lower=0)
+    total_demand = float(frame["demand"].sum())
+    passive_unmet = float(frame["passive_unmet"].sum())
+    dss_unmet = float(frame["dss_unmet"].sum())
+    plan = generate_rebalancing_plan(
+        metadata.assign(
+            bikes_available=(metadata["capacity"] * 0.55).round(),
+            lat=metadata["lat"],
+            lon=metadata["lon"],
+        )
+    )
+    distance = float(plan["distance_km"].sum()) if not plan.empty else 0.0
+    rows = [
+        {
+            "Scenario": "A · Thụ động",
+            "Unmet Demand": round(passive_unmet, 2),
+            "Service Level (%)": round((1 - passive_unmet / max(total_demand, 1)) * 100, 2),
+            "Truck Distance (km)": 0.0,
+        },
+        {
+            "Scenario": "B · BikeMind DSS",
+            "Unmet Demand": round(dss_unmet, 2),
+            "Service Level (%)": round((1 - dss_unmet / max(total_demand, 1)) * 100, 2),
+            "Truck Distance (km)": round(distance, 2),
+        },
+    ]
+    return pd.DataFrame(rows)
 
 
 def metric_card(label: str, value: str, hint: str, color: str = "#8B5CF6") -> None:
@@ -443,29 +520,10 @@ def clear_url_fragment() -> None:
 
 
 def forecast_chart(hourly: pd.DataFrame, station_id: str, selected_time: pd.Timestamp) -> None:
-    if (PROCESSED / "station_hour_cleaned.parquet").exists():
-        series = query_station_history(PROCESSED, station_id, selected_time + pd.Timedelta(hours=23), 200)
-    else:
-        series = hourly[hourly["station_id"].astype(str) == station_id].sort_values("timestamp").tail(48).copy()
-    series = series.tail(24).copy()
+    series = build_forecast_table(hourly, station_id, selected_time)
     if series.empty:
         st.info("Chưa có dữ liệu theo giờ cho trạm này.")
         return
-    for target in ("pickups", "returns"):
-        model_path = MODELS / f"lgb_{target}.pkl"
-        predicted = series[target].rolling(3, min_periods=1).mean() * (1.05 if target == "pickups" else 0.95)
-        if model_path.exists():
-            try:
-                bundle = load_model(model_path)
-                history = query_station_history(PROCESSED, station_id, selected_time + pd.Timedelta(hours=23), 200)
-                prepared = make_features(history if not history.empty else hourly, drop_missing=False)
-                current = prepared[prepared["station_id"].astype(str) == station_id].tail(24)
-                if len(current) == len(series) and all(col in current for col in bundle["features"]):
-                    predicted = pd.Series(np.maximum(0, bundle["model"].predict(current[bundle["features"]])),
-                                          index=series.index)
-            except (OSError, ValueError, KeyError, AttributeError):
-                pass
-        series[f"{target}_pred"] = np.asarray(predicted)[-len(series):]
     figure = go.Figure()
     figure.add_trace(go.Scatter(x=series["timestamp"], y=series["pickups"], name="Pickups thực tế", line={"color": "#22C55E"}))
     figure.add_trace(go.Scatter(x=series["timestamp"], y=series["pickups_pred"], name="Pickups dự báo", line={"color": "#86EFAC", "dash": "dot"}))
@@ -670,6 +728,53 @@ def restore_uc1_result() -> None:
         )
 
 
+def _frame_preview(frame: pd.DataFrame, limit: int = 10) -> list[dict[str, object]]:
+    """Serialize a small result preview without persisting the full dataset."""
+    return json.loads(frame.head(limit).to_json(orient="records", date_format="iso"))
+
+
+def _read_use_case_state() -> dict[str, dict[str, object]]:
+    if not USE_CASE_STATE_PATH.exists():
+        return {}
+    try:
+        state = json.loads(USE_CASE_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Không thể đọc trạng thái các Use Case: {USE_CASE_STATE_PATH}") from exc
+    if not isinstance(state, dict):
+        raise RuntimeError(f"File trạng thái Use Case không hợp lệ: {USE_CASE_STATE_PATH}")
+    return {
+        str(key): value
+        for key, value in state.items()
+        if isinstance(value, dict)
+    }
+
+
+def _persist_use_case_result(use_case: str, result: dict[str, object]) -> dict[str, dict[str, object]]:
+    state = _read_use_case_state()
+    state[use_case] = {
+        **result,
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    PROCESSED.mkdir(parents=True, exist_ok=True)
+    USE_CASE_STATE_PATH.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    st.session_state["use_case_state"] = state
+    return state
+
+
+def restore_persistent_results() -> None:
+    """Restore successful Use Case results after a browser/session reload."""
+    if "use_case_state" not in st.session_state:
+        st.session_state["use_case_state"] = _read_use_case_state()
+
+
+def _persisted_preview(state: dict[str, object], key: str) -> pd.DataFrame:
+    records = state.get(key, [])
+    return pd.DataFrame(records if isinstance(records, list) else [])
+
+
 def main() -> None:
     st.set_page_config(page_title="BikeMind DSS", page_icon="🚲", layout="wide", initial_sidebar_state="expanded")
     clear_url_fragment()
@@ -689,6 +794,8 @@ def main() -> None:
     </style>""", unsafe_allow_html=True)
     hourly, stations, data_source = load_dashboard_data()
     restore_uc1_result()
+    restore_persistent_results()
+    persistent_state = st.session_state["use_case_state"]
     data_status = build_data_status(hourly, stations, data_source)
     latest = pd.to_datetime(hourly["timestamp"]).max()
     if pd.isna(latest):
@@ -713,8 +820,13 @@ def main() -> None:
         st.metric("🟢 Cân bằng", int((snapshot.status == "Cân bằng").sum()))
     st.title("BikeMind Operations Center")
     st.caption(f"Live decision support · Cập nhật {latest:%d/%m/%Y %H:%M} · Safety buffer {safety:.0%}")
-    tabs = st.tabs(["📍 Vận hành Real-time", "📊 Phân tích Dự báo", "🚛 Đề xuất & Tái phân bổ",
-                    "⚙️ Quản trị Backend & AI", "📈 Mô phỏng & Backtesting"])
+    tabs = st.tabs([
+        "Use Case 07/09: 📍 Vận hành Real-time",
+        "Use Case 08: 📊 Phân tích Dự báo",
+        "Use Case 10-13: 🚛 Đề xuất & Tái phân bổ",
+        "Use Case 01-06: ⚙️ Quản trị Backend & AI",
+        "Use Case 14/15: 📈 Mô phỏng & Backtesting",
+    ])
     with tabs[0]:
         c1, c2, c3, c4 = st.columns(4)
         with c1: metric_card("Tổng trạm", f"{len(snapshot)}", "Mạng lưới đang giám sát")
@@ -725,7 +837,7 @@ def main() -> None:
         left, right = st.columns([2.1, 1])
         with left: render_map(snapshot)
         with right:
-            st.subheader("Stations cần chú ý")
+            st.subheader("Use Case 07: Stations cần chú ý")
             attention = snapshot[snapshot.status != "Cân bằng"].sort_values("utilization")
             st.dataframe(attention[["station_name", "bikes_available", "capacity", "status"]].rename(
                 columns={"station_name": "Trạm", "bikes_available": "Xe", "capacity": "Sức chứa", "status": "Trạng thái"}),
@@ -737,9 +849,22 @@ def main() -> None:
             chosen = st.selectbox("Chọn trạm", stations["station_name"].tolist())
             station_id = str(stations.loc[stations["station_name"] == chosen, "station_id"].iloc[0])
             forecast_chart(hourly, station_id, pd.Timestamp(selected_date))
+            forecast_data = build_forecast_table(hourly, station_id, pd.Timestamp(selected_date))
+            if not forecast_data.empty:
+                st.download_button(
+                    "Use Case 08: ⬇️ Tải CSV dự báo 24 giờ",
+                    forecast_data.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"forecast_station_{station_id}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
     with tabs[2]:
-        plan = generate_rebalancing_plan(snapshot, safety_buffer=safety)
-        st.subheader("Lịch trình xe tải · Gom → Rải")
+        planning_snapshot = snapshot.copy()
+        if not planning_snapshot.empty:
+            planning_snapshot["forecast_pickups"] = planning_snapshot["pickups"]
+            planning_snapshot["forecast_returns"] = planning_snapshot["returns"]
+        plan = run_greedy_rebalancing(planning_snapshot, buffer_pct=safety) if not planning_snapshot.empty else pd.DataFrame()
+        st.subheader("Use Case 10/11: Lịch trình xe tải · Gom → Rải")
         if snapshot.empty:
             st.info("Không có dữ liệu")
         elif plan.empty:
@@ -750,21 +875,21 @@ def main() -> None:
             with b:
                 metric_card("Tổng xe điều phối", f"{plan.bikes.sum():.0f}", f"{len(plan)} chặng")
                 metric_card("Quãng đường", f"{plan.distance_km.sum():.1f} km", "Greedy Haversine", "#F59E0B")
-                if st.button("✅ Phê duyệt Lệnh", type="primary", use_container_width=True):
+                if st.button("Use Case 12: ✅ Phê duyệt Lệnh", type="primary", use_container_width=True):
                     log_decision("APPROVED", plan); st.success("Đã ghi nhận lệnh điều phối.")
-                if st.button("❌ Từ chối", use_container_width=True):
+                if st.button("Use Case 12: ❌ Từ chối", use_container_width=True):
                     log_decision("REJECTED", plan); st.warning("Lệnh đã bị từ chối.")
             render_map(snapshot, plan)
-        st.markdown('<div class="section-card"><b>💡 Incentive gợi ý</b><br>Thưởng +15 điểm cho người dùng trả xe tại các trạm đang thiếu xe trong 60 phút tới.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-card"><b>Use Case 13: 💡 Incentive gợi ý</b><br>Thưởng +15 điểm cho người dùng trả xe tại các trạm đang thiếu xe trong 60 phút tới.</div>', unsafe_allow_html=True)
     with tabs[3]:
-        st.subheader("⚙️ Quản trị Backend & AI")
+        st.subheader("Use Case 01-06: ⚙️ Quản trị Backend & AI")
         render_data_status(data_status, "tab")
-        pipeline_tabs = st.tabs(["Quản trị Pipeline Dữ liệu", "Use Case 2 · Tiền xử lý dữ liệu"])
+        pipeline_tabs = st.tabs(["Use Case 01/05/06: Quản trị Pipeline Dữ liệu", "Use Case 02/03: Tiền xử lý dữ liệu"])
         with pipeline_tabs[0]:
-            st.markdown("#### Quản trị Pipeline Dữ liệu")
+            st.markdown("#### Use Case 01/05/06: Quản trị Pipeline Dữ liệu")
             if st.session_state.get("uc1_activation_message"):
                 st.success(st.session_state["uc1_activation_message"])
-            with st.expander("📁 Danh sách toàn bộ file CSV đang sử dụng", expanded=False):
+            with st.expander("Use Case 01: 📁 Danh sách toàn bộ file CSV đang sử dụng", expanded=False):
                 csv_inventory = list_project_csv_files(loaded_only=True)
                 if csv_inventory.empty:
                     st.info("Không tìm thấy file CSV hợp lệ trong thư mục data_load/.")
@@ -781,7 +906,7 @@ def main() -> None:
                         use_container_width=True,
                         height=320,
                     )
-            with st.expander("⚠️ Danh sách file CSV không sử dụng được", expanded=False):
+            with st.expander("Use Case 01: ⚠️ Danh sách file CSV không sử dụng được", expanded=False):
                 if UC1_REJECTED_CSV_PATH.exists():
                     try:
                         rejected_csv = json.loads(UC1_REJECTED_CSV_PATH.read_text(encoding="utf-8"))
@@ -811,7 +936,7 @@ def main() -> None:
                         st.info("Không có file CSV nào bị loại khỏi quá trình xử lý.")
                 else:
                     st.info("Chưa có thông tin file CSV không sử dụng được.")
-            with st.expander("🗑️ Xóa file CSV đã load", expanded=False):
+            with st.expander("Use Case 01: 🗑️ Xóa file CSV đã load", expanded=False):
                 loaded_csv_inventory = list_project_csv_files(loaded_only=True)
                 if loaded_csv_inventory.empty:
                     st.info("Không có file CSV đã load để xóa.")
@@ -832,7 +957,7 @@ def main() -> None:
                             key="confirm_delete_loaded_csv",
                         )
                         if st.button(
-                            "🗑️ Xác nhận xóa file đã chọn",
+                            "Use Case 01: 🗑️ Xác nhận xóa file đã chọn",
                             type="secondary",
                             disabled=not confirm_delete,
                             key="delete_selected_loaded_csv",
@@ -866,7 +991,7 @@ def main() -> None:
                 f"bản sao load: `{DATA_LOAD_DIRECTORY}` · chỉ quét các file `.csv`"
             )
             load_data_clicked = st.button(
-                "📥 Load Data",
+                "Use Case 01: 📥 Load Data",
                 type="primary",
                 key="uc1_load_data",
                 use_container_width=True,
@@ -944,32 +1069,134 @@ def main() -> None:
         with pipeline_tabs[0]:
             if data_source == "Không có dữ liệu":
                 st.info("Không có dữ liệu")
-            elif st.button("🧠 Retrain LightGBM Model", use_container_width=True):
-                with st.spinner("Chronological split 70/15/15 và huấn luyện..."):
-                    try:
-                        training_hourly = pd.read_parquet(PROCESSED / "station_hour_cleaned.parquet")
-                        training_hourly["timestamp"] = pd.to_datetime(training_hourly["timestamp"])
-                        training_hourly["station_id"] = training_hourly["station_id"].astype(str)
-                        metrics = train_models(training_hourly, MODELS)
-                        st.success("Đã lưu lgb_pickups.pkl và lgb_returns.pkl")
-                        st.dataframe(pd.DataFrame(metrics).T, use_container_width=True)
-                    except ValueError as exc:
-                        st.error(str(exc))
+            else:
+                build_features_clicked = st.button(
+                    "Use Case 04: 🧩 Build Features",
+                    use_container_width=True,
+                )
+                if build_features_clicked:
+                    with st.spinner("Đang tạo temporal, lag và rolling features..."):
+                        try:
+                            features = build_features_pipeline(
+                                PROCESSED / "station_hour_cleaned.parquet",
+                                FEATURES_PATH,
+                            )
+                            feature_rows = int(features.attrs.get("row_count", len(features)))
+                            persistent_state = _persist_use_case_result(
+                                "uc4",
+                                {
+                                    "rows": feature_rows,
+                                    "artifact": FEATURES_PATH.name,
+                                    "preview": _frame_preview(features),
+                                },
+                            )
+                            st.success(f"Đã lưu {feature_rows:,} dòng feature vào station_features.parquet.")
+                            st.dataframe(features.head(5), hide_index=True, use_container_width=True)
+                        except (OSError, ImportError, RuntimeError, ValueError) as exc:
+                            st.error(f"Không thể tạo features: {exc}")
+                retrain_clicked = st.button(
+                    "Use Case 05: 🧠 Retrain LightGBM Model",
+                    use_container_width=True,
+                )
+                if retrain_clicked:
+                    with st.spinner("Chronological split 70/15/15 và huấn luyện..."):
+                        try:
+                            training_hourly = pd.read_parquet(PROCESSED / "station_hour_cleaned.parquet")
+                            training_hourly["timestamp"] = pd.to_datetime(training_hourly["timestamp"])
+                            training_hourly["station_id"] = training_hourly["station_id"].astype(str)
+                            metrics = train_models(training_hourly, MODELS)
+                            persistent_state = _persist_use_case_result(
+                                "uc5",
+                                {
+                                    "metrics": metrics,
+                                    "artifacts": ["lgb_pickups.pkl", "lgb_returns.pkl"],
+                                },
+                            )
+                            st.success("Đã lưu lgb_pickups.pkl và lgb_returns.pkl")
+                            st.dataframe(pd.DataFrame(metrics).T, use_container_width=True)
+                        except (ImportError, OSError, ValueError, RuntimeError) as exc:
+                            st.error(f"Không thể huấn luyện model: {exc}")
+                benchmark_clicked = st.button(
+                    "Use Case 06: 📏 Run Baseline Benchmark",
+                    use_container_width=True,
+                )
+                if benchmark_clicked:
+                    with st.spinner("Đang so sánh Historical Average, Seasonal Naive và LightGBM..."):
+                        try:
+                            training_hourly = pd.read_parquet(PROCESSED / "station_hour_cleaned.parquet")
+                            benchmark = benchmark_models(training_hourly, MODELS)
+                            benchmark.to_csv(BENCHMARK_PATH, index=False)
+                            persistent_state = _persist_use_case_result(
+                                "uc6",
+                                {
+                                    "artifact": BENCHMARK_PATH.name,
+                                    "preview": _frame_preview(benchmark),
+                                },
+                            )
+                            st.dataframe(benchmark, hide_index=True, use_container_width=True)
+                            st.download_button(
+                                "Use Case 06: ⬇️ Tải benchmark CSV",
+                                benchmark.to_csv(index=False).encode("utf-8-sig"),
+                                file_name="bikemind_benchmark.csv",
+                                mime="text/csv",
+                            )
+                        except (ImportError, OSError, ValueError, RuntimeError) as exc:
+                            st.error(f"Không thể benchmark model: {exc}")
+                uc4_state = persistent_state.get("uc4")
+                if (
+                    not build_features_clicked
+                    and isinstance(uc4_state, dict)
+                    and FEATURES_PATH.exists()
+                ):
+                    st.success(
+                        f"Use Case 04 đã khôi phục: {int(uc4_state.get('rows', 0)):,} dòng feature."
+                    )
+                    st.dataframe(
+                        _persisted_preview(uc4_state, "preview"),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+                uc5_state = persistent_state.get("uc5")
+                if (
+                    not retrain_clicked
+                    and isinstance(uc5_state, dict)
+                    and all((MODELS / name).exists() for name in ("lgb_pickups.pkl", "lgb_returns.pkl"))
+                ):
+                    st.success("Use Case 05 đã khôi phục: lgb_pickups.pkl và lgb_returns.pkl.")
+                    st.dataframe(
+                        pd.DataFrame(uc5_state.get("metrics", {})).T,
+                        use_container_width=True,
+                    )
+                uc6_state = persistent_state.get("uc6")
+                if (
+                    not benchmark_clicked
+                    and isinstance(uc6_state, dict)
+                    and BENCHMARK_PATH.exists()
+                ):
+                    benchmark = pd.read_csv(BENCHMARK_PATH)
+                    st.success("Use Case 06 đã khôi phục từ benchmark đã lưu.")
+                    st.dataframe(benchmark, hide_index=True, use_container_width=True)
+                    st.download_button(
+                        "Use Case 06: ⬇️ Tải benchmark CSV",
+                        benchmark.to_csv(index=False).encode("utf-8-sig"),
+                        file_name="bikemind_benchmark.csv",
+                        mime="text/csv",
+                        key="restored_benchmark_download",
+                    )
             if data_source == "Không có dữ liệu":
                 st.info("Không có dữ liệu")
             else:
-                benchmark = pd.DataFrame({"Model": ["Historical Average", "Seasonal Naive", "BikeMind LightGBM"],
-                                          "MAE": [4.82, 4.15, 3.08], "RMSE": [7.31, 6.42, 4.96], "WAPE": ["42.1%", "36.7%", "27.4%"]})
-                st.subheader("Benchmark")
-                st.dataframe(benchmark, hide_index=True, use_container_width=True)
+                st.subheader("Use Case 06: Benchmark")
+                st.caption("Nhấn Run Baseline Benchmark để tính lại trên dữ liệu hiện tại.")
         with pipeline_tabs[1]:
-            st.markdown("#### Use Case 2 · Tiền xử lý dữ liệu")
-            if st.button(
-                "🧹 Khởi chạy Data Cleaning & Zero-Filling Pipeline (Use Case 2)",
+            st.markdown("#### Use Case 02: Tiền xử lý dữ liệu")
+            clean_data_clicked = st.button(
+                "Use Case 02: 🧹 Khởi chạy Data Cleaning & Zero-Filling Pipeline",
                 type="primary",
                 key="uc2_clean_data",
                 use_container_width=True,
-            ):
+            )
+            if clean_data_clicked:
                 with st.spinner(
                     "Đang đọc dữ liệu từ data_load/, lọc Outliers, trích xuất metadata "
                     "trạm và phủ kín lưới 24/7 (Zero-Filling)..."
@@ -986,6 +1213,20 @@ def main() -> None:
                         st.error(f"Không thể thực hiện Use Case 2: {exc}")
                     else:
                         load_dashboard_data.clear()
+                        persistent_state = _persist_use_case_result(
+                            "uc2",
+                            {
+                                "stats": {
+                                    key: int(value)
+                                    for key, value in cleaning_stats.items()
+                                },
+                                "preview": _frame_preview(cleaned_hourly),
+                                "artifacts": [
+                                    "station_hour_cleaned.parquet",
+                                    "station_metadata.parquet",
+                                ],
+                            },
+                        )
                         st.success(
                             "Đã hoàn tất làm sạch dữ liệu và tạo lưới thời gian 24/7 thành công!"
                         )
@@ -1007,22 +1248,59 @@ def main() -> None:
                             hide_index=True,
                             use_container_width=True,
                         )
-            st.markdown("#### Use Case 3 · GBFS Station Status Collector")
-            if st.button(
-                "🛰️ Kết nối GBFS & Thu thập Snapshot Trạm (Use Case 3)",
+            uc2_state = persistent_state.get("uc2")
+            if (
+                not clean_data_clicked
+                and isinstance(uc2_state, dict)
+                and (PROCESSED / "station_hour_cleaned.parquet").exists()
+                and (PROCESSED / "station_metadata.parquet").exists()
+            ):
+                stats = uc2_state.get("stats", {})
+                st.success("Use Case 02 đã khôi phục từ dữ liệu đã xử lý.")
+                stat_columns = st.columns(3)
+                stat_columns[0].metric(
+                    "Tổng số trạm đã chuẩn hóa",
+                    f"{int(stats.get('station_count', 0)):,}",
+                )
+                stat_columns[1].metric(
+                    "Bản ghi Station-Hour",
+                    f"{int(stats.get('station_hour_rows', 0)):,}",
+                )
+                stat_columns[2].metric(
+                    "Bản ghi bị loại",
+                    f"{int(stats.get('removed_rows', 0)):,}",
+                )
+                st.dataframe(
+                    _persisted_preview(uc2_state, "preview"),
+                    hide_index=True,
+                    use_container_width=True,
+                )
+            st.markdown("#### Use Case 03: GBFS Station Status Collector")
+            collect_gbfs_clicked = st.button(
+                "Use Case 03: 🛰️ Kết nối GBFS & Thu thập Snapshot Trạm",
                 type="primary",
                 key="uc3_collect_gbfs",
                 use_container_width=True,
-            ):
+            )
+            if collect_gbfs_clicked:
                 with st.spinner(
                     "Đang kết nối tới API GBFS công khai để lấy trạng thái tồn kho trạm thời gian thực..."
                 ):
                     collector_result = run_gbfs_collector_job(DB_PATH)
                 if collector_result["success"]:
+                    snapshot_data = collector_result["status_df"]
+                    persistent_state = _persist_use_case_result(
+                        "uc3",
+                        {
+                            "records_count": int(collector_result["records_count"]),
+                            "timestamp": collector_result["timestamp"],
+                            "preview": _frame_preview(snapshot_data),
+                            "artifact": DB_PATH.name,
+                        },
+                    )
                     st.success(
                         "Đã thu thập và lưu trữ snapshot trạng thái trạm vào SQLite thành công!"
                     )
-                    snapshot_data = collector_result["status_df"]
                     metric_columns = st.columns(2)
                     metric_columns[0].metric(
                         "Tổng số trạm đã cập nhật",
@@ -1042,19 +1320,75 @@ def main() -> None:
                         f"{collector_result['message']} "
                         "Vui lòng kiểm tra kết nối mạng, endpoint GBFS và quyền ghi file SQLite."
                     )
+            uc3_state = persistent_state.get("uc3")
+            if (
+                not collect_gbfs_clicked
+                and isinstance(uc3_state, dict)
+                and DB_PATH.exists()
+            ):
+                st.success(
+                    "Use Case 03 đã khôi phục snapshot GBFS gần nhất: "
+                    f"{int(uc3_state.get('records_count', 0)):,} trạm · "
+                    f"{uc3_state.get('timestamp', 'Không rõ thời điểm')}."
+                )
+                st.dataframe(
+                    _persisted_preview(uc3_state, "preview"),
+                    hide_index=True,
+                    use_container_width=True,
+                )
     with tabs[4]:
-        st.subheader("Historical Backtesting")
+        st.subheader("Use Case 14/15: Historical Backtesting")
         if hourly.empty or stations.empty:
             st.info("Không có dữ liệu")
-        elif st.button("▶ Chạy mô phỏng lịch sử", type="primary"):
-            total = query_hourly_total(PROCESSED) if not data_source.startswith("Demo") else float(hourly["pickups"].sum())
-            scenario = pd.DataFrame({"Metric": ["Unmet Demand", "Empty/Full events", "Truck distance (km)"],
-                                     "Scenario A · Thụ động": [total * 0.14, len(snapshot) * 2.4, 0],
-                                     "Scenario B · BikeMind DSS": [total * 0.061, len(snapshot) * 0.9, plan.distance_km.sum() if "plan" in locals() else 42.6]})
-            st.dataframe(scenario, hide_index=True, use_container_width=True)
-            st.success("Scenario B giảm unmet demand 56.4% so với baseline.")
         else:
-            st.info("Chọn khoảng thời gian và bấm chạy mô phỏng để so sánh hai kịch bản vận hành.")
+            backtesting_clicked = st.button(
+                "Use Case 14/15: ▶ Chạy mô phỏng lịch sử",
+                type="primary",
+            )
+            if backtesting_clicked:
+                scenario = run_historical_simulation(hourly, stations)
+                scenario.to_csv(BACKTESTING_PATH, index=False)
+                persistent_state = _persist_use_case_result(
+                    "uc14_15",
+                    {
+                        "artifact": BACKTESTING_PATH.name,
+                        "preview": _frame_preview(scenario),
+                    },
+                )
+                st.dataframe(scenario, hide_index=True, use_container_width=True)
+                baseline = float(scenario.loc[scenario["Scenario"] == "A · Thụ động", "Unmet Demand"].iloc[0])
+                dss = float(scenario.loc[scenario["Scenario"] == "B · BikeMind DSS", "Unmet Demand"].iloc[0])
+                improvement = max(0, (baseline - dss) / max(baseline, 1) * 100)
+                st.success(f"Scenario B giảm unmet demand {improvement:.1f}% so với baseline.")
+                st.download_button(
+                    "Use Case 15: ⬇️ Tải báo cáo backtesting",
+                    scenario.to_csv(index=False).encode("utf-8-sig"),
+                    file_name="bikemind_backtesting_report.csv",
+                    mime="text/csv",
+                    key="backtesting_download",
+                )
+            else:
+                backtesting_state = persistent_state.get("uc14_15")
+                if (
+                    isinstance(backtesting_state, dict)
+                    and BACKTESTING_PATH.exists()
+                ):
+                    scenario = pd.read_csv(BACKTESTING_PATH)
+                    st.success("Use Case 14/15 đã khôi phục báo cáo backtesting đã lưu.")
+                    st.dataframe(scenario, hide_index=True, use_container_width=True)
+                    baseline = float(scenario.loc[scenario["Scenario"] == "A · Thụ động", "Unmet Demand"].iloc[0])
+                    dss = float(scenario.loc[scenario["Scenario"] == "B · BikeMind DSS", "Unmet Demand"].iloc[0])
+                    improvement = max(0, (baseline - dss) / max(baseline, 1) * 100)
+                    st.info(f"Scenario B giảm unmet demand {improvement:.1f}% so với baseline.")
+                    st.download_button(
+                        "Use Case 15: ⬇️ Tải báo cáo backtesting",
+                        scenario.to_csv(index=False).encode("utf-8-sig"),
+                        file_name="bikemind_backtesting_report.csv",
+                        mime="text/csv",
+                        key="restored_backtesting_download",
+                    )
+                else:
+                    st.info("Chọn khoảng thời gian và bấm chạy mô phỏng để so sánh hai kịch bản vận hành.")
 
 
 if __name__ == "__main__":
