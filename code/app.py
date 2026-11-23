@@ -712,6 +712,11 @@ def restore_uc1_result() -> None:
             "unique",
             "dup_files",
             "dup_rows",
+            "schema_errors",
+            "read_errors",
+            "invalid_files",
+            "raw_rows",
+            "row_count",
             "previous_rows",
             "new_unique_rows",
             "combined_rows",
@@ -1016,7 +1021,7 @@ def main() -> None:
                             output_directory=PROCESSED,
                             progress_callback=update_load_progress,
                         )
-                except (OSError, RuntimeError, ValueError) as exc:
+                except (OSError, RuntimeError, ValueError, MemoryError) as exc:
                     st.error(f"Không thể sao chép hoặc xử lý dữ liệu CSV: {exc}")
                     st.stop()
                 load_dashboard_data.clear()
@@ -1055,6 +1060,11 @@ def main() -> None:
                         f"{load_stats.get('row_count', len(loaded_data)):,}",
                     )
                     st.caption(f"Đã loại {load_stats['dup_rows']:,} bản ghi trùng hoàn toàn.")
+                    st.caption(
+                        f"File sai schema: {load_stats.get('schema_errors', 0):,} · "
+                        f"File đọc/lỗi: {load_stats.get('read_errors', 0):,} · "
+                        f"Tổng file không hợp lệ: {load_stats.get('invalid_files', 0):,}"
+                    )
                     if "previous_rows" in load_stats:
                         st.caption(
                             f"Hợp nhất dữ liệu: {load_stats['previous_rows']:,} dòng trước đó + "

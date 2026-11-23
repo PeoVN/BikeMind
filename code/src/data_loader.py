@@ -31,13 +31,13 @@ CORE_TRIP_COLUMNS = [
 ]
 
 CORE_TRIP_DTYPES = {
-    "tripduration": "int32",
-    "start station id": "float32",
-    "start station name": "category",
+    "tripduration": "Int32",
+    "start station id": "Int32",
+    "start station name": "string",
     "start station latitude": "float32",
     "start station longitude": "float32",
-    "end station id": "float32",
-    "end station name": "category",
+    "end station id": "Int32",
+    "end station name": "string",
     "end station latitude": "float32",
     "end station longitude": "float32",
 }
@@ -169,15 +169,31 @@ def scan_and_load_unique_csv(
     Files are deduplicated by MD5 before loading and rows are deduplicated
     after concatenation. Invalid or unreadable files are skipped with a log.
     """
-    base_path = Path(base_directory) if base_directory is not None else _default_data_directory()
+    base_path = (
+        Path(base_directory).expanduser().resolve()
+        if base_directory is not None
+        else _default_data_directory().resolve()
+    )
     candidates = [
-        path for path in base_path.rglob("*.csv")
+        path for path in base_path.rglob("*")
         if path.is_file() and path.suffix.lower() == ".csv"
         and not _is_ignored_path(path) and path.stat().st_size > 0
     ] if base_path.exists() else []
-    stats = {"total": len(candidates), "unique": 0, "dup_files": 0, "dup_rows": 0}
+    stats = {
+        "total": len(candidates),
+        "unique": 0,
+        "dup_files": 0,
+        "schema_errors": 0,
+        "read_errors": 0,
+        "invalid_files": 0,
+        "dup_rows": 0,
+        "raw_rows": 0,
+        "row_count": 0,
+    }
     seen_hashes: set[str] = set()
     frames: list[pd.DataFrame] = []
+    batch_frames: list[pd.DataFrame] = []
+    batch_size = 8
 
     if progress_callback is not None:
         progress_callback(0, stats["total"], "Đang chuẩn bị danh sách file CSV...", 0)
@@ -185,64 +201,139 @@ def scan_and_load_unique_csv(
     for processed_files, path in enumerate(sorted(candidates), start=1):
         file_hash = calculate_file_hash(path)
         if not file_hash:
+            stats["read_errors"] += 1
+            stats["invalid_files"] += 1
+            logger.warning("Không thể đọc file để tính MD5: %s", path)
             if progress_callback is not None:
                 progress_callback(processed_files, stats["total"], "Không thể đọc file, đang chuyển sang file tiếp theo...", 0)
             continue
         if file_hash in seen_hashes:
             stats["dup_files"] += 1
             logger.info("Bỏ qua file trùng MD5: %s", path)
-            print(f"[UC1] Duplicate file skipped (MD5): {path}")
             if progress_callback is not None:
                 progress_callback(processed_files, stats["total"], f"Bỏ qua file trùng: {path.name}", sum(len(frame) for frame in frames))
             continue
         seen_hashes.add(file_hash)
         if progress_callback is not None:
             progress_callback(processed_files, stats["total"], f"Đang đọc dữ liệu: {path.name}", sum(len(frame) for frame in frames))
+
+        plan, schema_error = build_normalization_plan(path)
+        if schema_error is not None:
+            stats["schema_errors"] += 1
+            stats["invalid_files"] += 1
+            logger.warning("Bỏ qua %s: %s", path, schema_error)
+            if progress_callback is not None:
+                progress_callback(processed_files, stats["total"], f"Sai schema: {path.name}", sum(len(frame) for frame in frames))
+            continue
+
         try:
+            source_columns = list(dict.fromkeys(plan.values()))
             frame = pd.read_csv(
                 path,
-                usecols=lambda column: str(column).strip().lower() in {item.lower() for item in CORE_TRIP_COLUMNS},
-                dtype=CORE_TRIP_DTYPES,
+                usecols=source_columns,
+                dtype={
+                    plan["start station id"]: "Int32",
+                    plan["start station name"]: "string",
+                    plan["start station latitude"]: "float32",
+                    plan["start station longitude"]: "float32",
+                    plan["end station id"]: "Int32",
+                    plan["end station name"]: "string",
+                    plan["end station latitude"]: "float32",
+                    plan["end station longitude"]: "float32",
+                    **({"tripduration": "Int32"} if "tripduration" in plan else {}),
+                },
                 low_memory=False,
             )
-        except (OSError, UnicodeDecodeError, pd.errors.EmptyDataError, pd.errors.ParserError, ValueError, TypeError) as exc:
+        except (OSError, UnicodeDecodeError, pd.errors.EmptyDataError, pd.errors.ParserError, ValueError, TypeError, MemoryError) as exc:
+            stats["read_errors"] += 1
+            stats["invalid_files"] += 1
             logger.warning("Bỏ qua file CSV không hợp lệ %s: %s", path, exc)
             if progress_callback is not None:
                 progress_callback(processed_files, stats["total"], f"File không hợp lệ: {path.name}", sum(len(item) for item in frames))
             continue
-        frame.columns = [str(column).strip().lower() for column in frame.columns]
+
+        renamed = {
+            source_name: field
+            for field, source_name in plan.items()
+        }
+        frame = frame.rename(columns=renamed)
+        frame["starttime"] = pd.to_datetime(frame["starttime"], errors="coerce")
+        frame["stoptime"] = pd.to_datetime(frame["stoptime"], errors="coerce")
+        if "tripduration" not in frame.columns:
+            frame["tripduration"] = (
+                (frame["stoptime"] - frame["starttime"]).dt.total_seconds().astype("Int64")
+            )
+
+        frame["tripduration"] = pd.to_numeric(frame["tripduration"], errors="coerce").astype("Int32")
+        frame["start station id"] = pd.to_numeric(frame["start station id"], errors="coerce").astype("Int32")
+        frame["end station id"] = pd.to_numeric(frame["end station id"], errors="coerce").astype("Int32")
+        frame = frame.dropna(subset=[
+            "tripduration", "starttime", "stoptime",
+            "start station id", "end station id",
+        ])
+
         missing = [column for column in CORE_TRIP_COLUMNS if column not in frame.columns]
-        if missing:
-            logger.warning("Bỏ qua %s vì thiếu cột bắt buộc: %s", path, ", ".join(missing))
+        if missing or frame.empty:
+            stats["schema_errors"] += 1
+            stats["invalid_files"] += 1
+            logger.warning("Bỏ qua %s vì thiếu cột bắt buộc hoặc không còn bản ghi hợp lệ: %s", path, ", ".join(missing))
             continue
-        # A category is efficient while reading each file, but concatenating
-        # many independent category dictionaries causes a large temporary
-        # union allocation inside pandas. Normalize before batching.
+
         for name_column in ("start station name", "end station name"):
             frame[name_column] = frame[name_column].astype("string")
+
+        before_file_dedup = len(frame)
+        frame = frame.drop_duplicates(subset=CORE_TRIP_COLUMNS).reset_index(drop=True)
+        file_dup_rows = before_file_dedup - len(frame)
+        stats["dup_rows"] += file_dup_rows
+        stats["raw_rows"] += before_file_dedup
+
         frames.append(frame[CORE_TRIP_COLUMNS])
         stats["unique"] += 1
         if progress_callback is not None:
             progress_callback(processed_files, stats["total"], f"Đã nạp: {path.name}", sum(len(item) for item in frames))
 
+        if len(frames) >= batch_size:
+            batch = pd.concat(frames, ignore_index=True, copy=False)
+            frames.clear()
+            before_batch_dedup = len(batch)
+            batch = batch.drop_duplicates(subset=CORE_TRIP_COLUMNS).reset_index(drop=True)
+            stats["dup_rows"] += before_batch_dedup - len(batch)
+            batch_frames.append(batch)
+            del batch
+            gc.collect()
+
     if not frames:
+        merged_parts = batch_frames
+    else:
+        batch = pd.concat(frames, ignore_index=True, copy=False)
+        frames.clear()
+        before_batch_dedup = len(batch)
+        batch = batch.drop_duplicates(subset=CORE_TRIP_COLUMNS).reset_index(drop=True)
+        stats["dup_rows"] += before_batch_dedup - len(batch)
+        batch_frames.append(batch)
+        merged_parts = batch_frames
+
+    if not merged_parts:
         if progress_callback is not None:
             progress_callback(stats["total"], stats["total"], "Không tìm thấy dữ liệu CSV hợp lệ.", 0)
+        stats["row_count"] = 0
         return pd.DataFrame(columns=CORE_TRIP_COLUMNS), stats
-    merged_parts: list[pd.DataFrame] = []
-    batch_size = 8
-    for start in range(0, len(frames), batch_size):
-        merged_parts.append(pd.concat(frames[start:start + batch_size], ignore_index=True, copy=False))
-    del frames
-    gc.collect()
-    merged = pd.concat(merged_parts, ignore_index=True, copy=False)
-    del merged_parts
+
+    try:
+        merged = pd.concat(merged_parts, ignore_index=True, copy=False)
+    except MemoryError as exc:
+        raise RuntimeError(
+            "Không đủ RAM để gộp các lô dữ liệu UC01. "
+            "Hãy tải ít file hơn hoặc bật chế độ DuckDB spill-to-disk."
+        ) from exc
     gc.collect()
     before_dedup = len(merged)
-    merged = merged.drop_duplicates(ignore_index=True)
+    merged = merged.drop_duplicates(subset=CORE_TRIP_COLUMNS, ignore_index=True)
+    stats["dup_rows"] += before_dedup - len(merged)
     for name_column in ("start station name", "end station name"):
         merged[name_column] = merged[name_column].astype("category")
-    stats["dup_rows"] = before_dedup - len(merged)
+    stats["row_count"] = len(merged)
     if progress_callback is not None:
         progress_callback(stats["total"], stats["total"], "Đã khử trùng bản ghi và hoàn tất nạp dữ liệu.", len(merged))
     return merged, stats
@@ -263,12 +354,17 @@ def scan_and_prepare_unique_csv(
     except ImportError as exc:
         raise RuntimeError("DuckDB chưa được cài đặt. Chạy: pip install duckdb") from exc
 
-    base_path = Path(base_directory) if base_directory is not None else _default_data_directory()
+    base_path = (
+        Path(base_directory).expanduser().resolve()
+        if base_directory is not None
+        else _default_data_directory().resolve()
+    )
     output_path = Path(output_directory) if output_directory is not None else base_path.parent / "code" / "processed"
     output_path.mkdir(parents=True, exist_ok=True)
     candidates = [
-        path for path in base_path.rglob("*.csv")
+        path for path in base_path.rglob("*")
         if path.is_file() and not _is_ignored_path(path) and path.stat().st_size > 0
+        and path.suffix.lower() == ".csv"
     ] if base_path.exists() else []
     manifest_path = output_path / "uc1_loaded_csv_files.json"
     rejected_path = output_path / "uc1_rejected_csv_files.json"
@@ -283,7 +379,17 @@ def scan_and_prepare_unique_csv(
         for item in previous_manifest
         if isinstance(item, dict) and item.get("relative_path")
     }
-    stats = {"total": len(candidates), "unique": 0, "dup_files": 0, "dup_rows": 0}
+    stats = {
+        "total": len(candidates),
+        "unique": 0,
+        "dup_files": 0,
+        "schema_errors": 0,
+        "read_errors": 0,
+        "invalid_files": 0,
+        "dup_rows": 0,
+        "raw_rows": 0,
+        "row_count": 0,
+    }
     seen_hashes: set[str] = set()
     unique_paths: list[Path] = []
     file_hashes: dict[Path, str] = {}
@@ -293,6 +399,8 @@ def scan_and_prepare_unique_csv(
         normalization_plan, normalization_error = build_normalization_plan(path)
         if normalization_error is not None:
             logger.warning("Bỏ qua %s: %s", path, normalization_error)
+            stats["schema_errors"] += 1
+            stats["invalid_files"] += 1
             rejected_files.append(
                 {
                     "File": path.name,
@@ -323,6 +431,8 @@ def scan_and_prepare_unique_csv(
                     "Lý do": "Không thể đọc file để tính mã MD5.",
                 }
             )
+            stats["read_errors"] += 1
+            stats["invalid_files"] += 1
             if progress_callback is not None:
                 progress_callback(index, len(candidates), f"Không thể đọc file: {path.name}", 0)
             continue
@@ -565,6 +675,11 @@ def scan_and_prepare_unique_csv(
             "Dữ liệu vượt quá bộ nhớ khả dụng khi tạo station-hour. "
             "DuckDB đã dùng chế độ spill-to-disk; hãy giải phóng thêm dung lượng RAM/ổ đĩa tạm rồi thử lại."
         ) from exc
+    except duckdb.Error as exc:
+        raise RuntimeError(
+            "DuckDB không thể đọc hoặc xử lý một phần dữ liệu UC01; "
+            "đã bỏ qua file sai schema ở bước quét và log chi tiết vào DuckDB."
+        ) from exc
     finally:
         connection.close()
 
@@ -579,9 +694,12 @@ def scan_csv_files(roots: str | Path | Iterable[str | Path]) -> list[Path]:
         if root_path.is_file() and root_path.suffix.lower() == ".csv":
             candidates = [root_path]
         else:
-            candidates = root_path.rglob("*.csv") if root_path.exists() else []
+            candidates = (
+                path for path in root_path.rglob("*")
+                if path.is_file() and path.suffix.lower() == ".csv"
+            ) if root_path.exists() else []
         for path in candidates:
-            if "__MACOSX" in path.parts or path.name.startswith("._"):
+            if "__MACOSX" in {part.upper() for part in path.parts} or path.name.startswith("._"):
                 continue
             digest = _file_digest(path)
             if not digest:
@@ -605,11 +723,44 @@ def load_trip_data(roots: str | Path | Iterable[str | Path], limit_files: int | 
     frames: list[pd.DataFrame] = []
     for path in files:
         try:
-            frame = pd.read_csv(path, low_memory=False)
-            frame = _normalise_columns(frame)
+            plan, schema_error = build_normalization_plan(path)
+            if schema_error is not None:
+                logger.warning("Bỏ qua %s: %s", path, schema_error)
+                continue
+            frame = pd.read_csv(
+                path,
+                usecols=list(dict.fromkeys(plan.values())),
+                dtype={
+                    plan["start station id"]: "Int32",
+                    plan["start station name"]: "string",
+                    plan["start station latitude"]: "float32",
+                    plan["start station longitude"]: "float32",
+                    plan["end station id"]: "Int32",
+                    plan["end station name"]: "string",
+                    plan["end station latitude"]: "float32",
+                    plan["end station longitude"]: "float32",
+                    **({"tripduration": "Int32"} if "tripduration" in plan else {}),
+                },
+                low_memory=False,
+            )
+            frame = frame.rename(columns={
+                source_name: field
+                for field, source_name in plan.items()
+            })
+            frame["starttime"] = pd.to_datetime(frame["starttime"], errors="coerce")
+            frame["stoptime"] = pd.to_datetime(frame["stoptime"], errors="coerce")
+            if "tripduration" not in frame.columns:
+                frame["tripduration"] = (
+                    (frame["stoptime"] - frame["starttime"]).dt.total_seconds().astype("Int64")
+                )
+            frame = frame.dropna(subset=["tripduration", "starttime", "stoptime"])
+            before_dedup = len(frame)
+            frame = frame.drop_duplicates().reset_index(drop=True)
+            frame.attrs["_dedup_rows"] = before_dedup - len(frame)
             frame["_source_file"] = str(path)
             frames.append(frame)
-        except (OSError, UnicodeDecodeError, pd.errors.ParserError):
+        except (OSError, UnicodeDecodeError, pd.errors.EmptyDataError, pd.errors.ParserError, ValueError, TypeError, MemoryError) as exc:
+            logger.warning("Không thể đọc file %s: %s", path, exc)
             continue
     if not frames:
         return pd.DataFrame()
