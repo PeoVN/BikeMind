@@ -39,7 +39,7 @@ from src.data_loader import (
     scan_csv_files,
 )
 from src.feature_engineering import build_features_pipeline, make_features, feature_columns
-from src.gbfs_collector import run_gbfs_collector_job
+from src.gbfs_collector import load_latest_station_status, run_gbfs_collector_job
 from src.model_trainer import benchmark_models, load_model, train_models
 from src.rebalancing_engine import generate_rebalancing_plan, run_greedy_rebalancing
 
@@ -49,7 +49,7 @@ DATA_DIRECTORY = ROOT.parent / "data"
 DATA_LOAD_DIRECTORY = ROOT.parent / "data_load"
 PROCESSED = ROOT / "processed"
 MODELS = ROOT / "models"
-DB_PATH = ROOT / "bikemind_decisions.sqlite"
+DB_PATH = (ROOT / "bikemind_decisions.sqlite").resolve()
 UC1_DATA_PATH = PROCESSED / "uc1_loaded_trips.parquet"
 UC1_FULL_DATA_PATH = PROCESSED / "uc1_trips_deduplicated.parquet"
 UC1_DATA_CSV_PATH = PROCESSED / "uc1_loaded_trips.csv"
@@ -365,12 +365,12 @@ def _station_snapshot(hourly: pd.DataFrame, stations: pd.DataFrame, timestamp: p
     if "timestamp" not in latest or "station_id" not in latest:
         latest = pd.DataFrame(columns=["station_id", "pickups", "returns", "timestamp"])
     latest["station_id"] = (
-        latest["station_id"].astype("string").str.strip().str.replace(r"\.0$", "", regex=True)
+        latest["station_id"].map(_normalize_station_id)
     )
     latest = latest[latest["timestamp"] <= timestamp].sort_values("timestamp").groupby("station_id").tail(1)
     result = stations.copy()
     result["station_id"] = (
-        result["station_id"].astype("string").str.strip().str.replace(r"\.0$", "", regex=True)
+        result["station_id"].map(_normalize_station_id)
     )
     result = result.merge(latest[["station_id", "pickups", "returns"]], on="station_id", how="left").fillna(0)
     result["bikes_available"] = (result["capacity"] * 0.55 + result["returns"] - result["pickups"]).clip(0, result["capacity"])
@@ -387,17 +387,132 @@ def _query_station_snapshot(timestamp: pd.Timestamp, stations: pd.DataFrame) -> 
     return _station_snapshot(latest, stations, timestamp)
 
 
+def _normalize_station_id(value: object) -> str:
+    """Normalize numeric/text station identifiers without changing source data."""
+    if value is None or pd.isna(value):
+        return ""
+    station_id = str(value).strip()
+    if station_id.endswith(".0"):
+        station_id = station_id[:-2]
+    if station_id.startswith("+"):
+        station_id = station_id[1:]
+    try:
+        number = float(station_id)
+        if math.isfinite(number) and number.is_integer():
+            station_id = str(int(number))
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return station_id
+
+
+def _load_station_aliases() -> dict[str, str]:
+    """Load optional station-id aliases from processed/station_id_aliases.json."""
+    alias_path = PROCESSED / "station_id_aliases.json"
+    if not alias_path.exists():
+        return {}
+    try:
+        payload = json.loads(alias_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    aliases: dict[str, str] = {}
+    for alias, canonical in payload.items():
+        normalized_alias = _normalize_station_id(alias)
+        normalized_canonical = _normalize_station_id(canonical)
+        if normalized_alias and normalized_canonical:
+            aliases[normalized_alias] = normalized_canonical
+    return aliases
+
+
+def _overlay_gbfs_snapshot(
+    estimated: pd.DataFrame,
+    gbfs_status: pd.DataFrame,
+) -> pd.DataFrame:
+    """Use only fresh, identity-matched GBFS rows; label all estimated rows."""
+    result = estimated.copy()
+    if result.empty:
+        return result
+    result["inventory_source"] = "Ước tính từ station-hour"
+    result["capacity_source"] = "Ước tính từ station_metadata"
+    if gbfs_status.empty or "is_usable" not in gbfs_status.columns:
+        return result
+
+    live = gbfs_status.loc[gbfs_status["is_usable"]].copy()
+    if live.empty:
+        return result
+    aliases = _load_station_aliases()
+    if "station_id_alias" in result.columns:
+        for alias, canonical in result[["station_id_alias", "station_id"]].dropna().astype(str).itertuples(index=False, name=None):
+            normalized_alias = _normalize_station_id(alias)
+            normalized_canonical = _normalize_station_id(canonical)
+            if normalized_alias and normalized_canonical:
+                aliases[normalized_alias] = normalized_canonical
+
+    result["station_id"] = result["station_id"].map(_normalize_station_id)
+    live["station_id"] = live["station_id"].map(_normalize_station_id)
+    if aliases:
+        result["station_id"] = result["station_id"].map(
+            lambda station_id: aliases.get(station_id, station_id)
+        )
+        live["station_id"] = live["station_id"].map(
+            lambda station_id: aliases.get(station_id, station_id)
+        )
+    live = live.drop_duplicates("station_id", keep="last").set_index("station_id")
+    live_ids = result["station_id"].isin(live.index)
+    if not live_ids.any():
+        return result
+
+    live_bikes = result["station_id"].map(live["bikes_available"])
+    result.loc[live_ids, "bikes_available"] = live_bikes.loc[live_ids].astype(float)
+    if "capacity" in live:
+        live_capacity = result["station_id"].map(live["capacity"])
+        use_live_capacity = live_ids & live_capacity.notna()
+        result.loc[use_live_capacity, "capacity"] = live_capacity.loc[
+            use_live_capacity
+        ].astype(float)
+        result.loc[use_live_capacity, "capacity_source"] = "GBFS station_information"
+    if "station_name" in live:
+        live_names = result["station_id"].map(live["station_name"])
+        use_live_name = live_ids & live_names.notna() & live_names.astype(str).str.strip().ne("")
+        result.loc[use_live_name, "station_name"] = live_names.loc[use_live_name]
+    result.loc[live_ids, "pickups"] = np.nan
+    result.loc[live_ids, "returns"] = np.nan
+    result.loc[live_ids, "inventory_source"] = "GBFS thời gian thực"
+    result["utilization"] = result["bikes_available"] / result["capacity"].replace(0, np.nan)
+    result["status"] = np.select(
+        [
+            result["utilization"] < 0.25,
+            result["utilization"] > 0.8,
+        ],
+        ["Thiếu xe", "Đầy xe"],
+        default="Cân bằng",
+    )
+    return result
+
+
 def _status_color(status: str) -> str:
     return {"Thiếu xe": "#EF4444", "Đầy xe": "#A855F7", "Cân bằng": "#22C55E"}.get(status, "#94A3B8")
 
 
 def render_map(snapshot: pd.DataFrame, plan: pd.DataFrame | None = None, height: int = 570) -> None:
     center = [snapshot["lat"].mean(), snapshot["lon"].mean()] if not snapshot.empty else [40.74, -73.99]
-    fmap = folium.Map(location=center, zoom_start=12, tiles="CartoDB positron", control_scale=True)
+    fmap = folium.Map(
+        location=center,
+        zoom_start=12,
+        tiles="OpenStreetMap",
+        attr="© OpenStreetMap contributors",
+        control_scale=True,
+    )
     Fullscreen(position="topright").add_to(fmap)
     for row in snapshot.to_dict("records"):
+        pickups = "—" if pd.isna(row["pickups"]) else f"{row['pickups']:.0f}"
+        returns = "—" if pd.isna(row["returns"]) else f"{row['returns']:.0f}"
+        source = row.get("inventory_source", "Không rõ nguồn")
         popup = (f"<b>{row['station_name']}</b><br>Xe khả dụng: {row['bikes_available']:.0f}/{row['capacity']}<br>"
-                 f"Trạng thái: {row['status']}<br>Pickups: {row['pickups']:.0f} | Returns: {row['returns']:.0f}")
+                 f"Trạng thái: {row['status']}<br>Nguồn tồn kho: {source}<br>"
+                 f"Nguồn sức chứa: {row.get('capacity_source', 'Không rõ')}<br>"
+                 f"Pickups: {pickups} | Returns: {returns}")
         folium.CircleMarker([row["lat"], row["lon"]], radius=10, color=_status_color(row["status"]),
                             fill=True, fill_color=_status_color(row["status"]), fill_opacity=0.9,
                             tooltip=f"{row['station_name']} · {row['status']}", popup=popup).add_to(fmap)
@@ -780,6 +895,63 @@ def _persisted_preview(state: dict[str, object], key: str) -> pd.DataFrame:
     return pd.DataFrame(records if isinstance(records, list) else [])
 
 
+def _json_ready(value: object) -> object:
+    """Convert UC02 stats to JSON values without coercing timestamps to integers."""
+    if isinstance(value, dict):
+        return {str(key): _json_ready(item) for key, item in value.items()}
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if hasattr(value, "item"):
+        try:
+            return _json_ready(value.item())
+        except (TypeError, ValueError):
+            return str(value)
+    return str(value)
+
+
+def _render_uc2_audit(stats: dict[str, object], preview: pd.DataFrame) -> None:
+    """Show the latest UC02 audit from memory. This does not rerun cleaning."""
+    def as_int(key: str) -> int:
+        try:
+            return int(stats.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    stat_columns = st.columns(3)
+    stat_columns[0].metric("Tổng số trạm đã chuẩn hóa", f"{as_int('station_count'):,}")
+    stat_columns[1].metric("Bản ghi Station-Hour", f"{as_int('station_hour_rows'):,}")
+    stat_columns[2].metric("Bản ghi bị loại", f"{as_int('removed_rows'):,}")
+    if stats.get("t_min") and stats.get("t_max"):
+        st.caption(f"Độ phủ thời gian: {stats['t_min']} → {stats['t_max']}")
+    st.caption(
+        f"Ô giờ không phát sinh giao dịch được phủ 0: {as_int('zero_filled_cells'):,} · "
+        f"Ô có giao dịch: {as_int('observed_station_hours'):,}"
+    )
+    if stats.get("capacity_estimated") in (True, "True", 1, "1"):
+        st.caption(
+            "Sức chứa trạm là giá trị ước tính thử nghiệm "
+            f"({as_int('capacity') or 25}), nhãn `{stats.get('capacity_source', 'estimated_default')}`."
+        )
+    if "removed_duration" in stats:
+        audit = pd.DataFrame(
+            [
+                ["Đầu vào", as_int("input_rows") or as_int("source_rows")],
+                ["Thiếu station_id", as_int("removed_missing_station_id")],
+                ["Thời gian không parse được", as_int("removed_invalid_timestamp")],
+                ["stoptime <= starttime", as_int("removed_time_order")],
+                ["Thời lượng ngoài 60–7200 giây", as_int("removed_duration")],
+                ["Cùng trạm và dưới 180 giây", as_int("removed_same_station_short")],
+                ["Tọa độ thiếu hoặc ngoài vùng hợp lệ", as_int("removed_invalid_coordinates")],
+                ["Bản ghi trùng sau khi lọc", as_int("removed_duplicate_rows")],
+                ["Bản ghi sạch", as_int("clean_rows")],
+            ],
+            columns=["Quy tắc", "Số bản ghi"],
+        )
+        st.dataframe(audit, hide_index=True, use_container_width=True)
+    if not preview.empty:
+        st.dataframe(preview.head(5), hide_index=True, use_container_width=True)
+
+
 def main() -> None:
     st.set_page_config(page_title="BikeMind DSS", page_icon="🚲", layout="wide", initial_sidebar_state="expanded")
     clear_url_fragment()
@@ -798,6 +970,7 @@ def main() -> None:
     [data-testid="stHeaderActionElements"] button { display:none !important; }
     </style>""", unsafe_allow_html=True)
     hourly, stations, data_source = load_dashboard_data()
+    gbfs_status, gbfs_freshness = load_latest_station_status(DB_PATH)
     restore_uc1_result()
     restore_persistent_results()
     persistent_state = st.session_state["use_case_state"]
@@ -815,16 +988,72 @@ def main() -> None:
         safety = st.slider("Safety Buffer (%)", 0, 50, 15) / 100
         snapshot_time = pd.Timestamp(selected_date) + pd.Timedelta(hours=selected_hour)
         if data_source.startswith("Demo"):
-            snapshot = _station_snapshot(hourly, stations, snapshot_time)
+            estimated_snapshot = _station_snapshot(hourly, stations, snapshot_time)
         else:
-            snapshot = _query_station_snapshot(snapshot_time, stations)
+            estimated_snapshot = _query_station_snapshot(snapshot_time, stations)
+        snapshot = _overlay_gbfs_snapshot(estimated_snapshot, gbfs_status)
+        live_station_count = (
+            int((snapshot["inventory_source"] == "GBFS thời gian thực").sum())
+            if "inventory_source" in snapshot
+            else 0
+        )
+        estimated_station_count = max(0, len(snapshot) - live_station_count)
         st.divider()
         st.caption(f"📦 Nguồn dữ liệu: {data_source}")
+        if live_station_count:
+            st.caption(
+                f"GBFS đã xác thực/còn mới: {live_station_count:,} trạm · "
+                f"thu thập {gbfs_freshness.get('collected_at', 'không rõ thời điểm')}"
+            )
+        else:
+            st.caption("Tồn kho trên bản đồ đang dùng dữ liệu ước tính station-hour.")
         st.metric("🔴 Thiếu xe", int((snapshot.status == "Thiếu xe").sum()))
         st.metric("🟣 Đầy xe", int((snapshot.status == "Đầy xe").sum()))
         st.metric("🟢 Cân bằng", int((snapshot.status == "Cân bằng").sum()))
     st.title("BikeMind Operations Center")
-    st.caption(f"Live decision support · Cập nhật {latest:%d/%m/%Y %H:%M} · Safety buffer {safety:.0%}")
+    st.caption(
+        f"Live decision support · Dữ liệu station-hour đến {latest:%d/%m/%Y %H:%M} · "
+        f"Safety buffer {safety:.0%}"
+    )
+    if gbfs_freshness.get("optional_missing_count"):
+        st.caption(
+            f"GBFS có {int(gbfs_freshness['optional_missing_count']):,} bản ghi thiếu trường tùy chọn; "
+            "sức chứa thiếu từ station_information sẽ dùng giá trị station_metadata (có thể là ước tính)."
+        )
+    if live_station_count and estimated_station_count:
+        st.warning(
+            f"Nguồn tồn kho hỗn hợp: {live_station_count:,} trạm dùng GBFS đã xác thực "
+            f"(thu thập {gbfs_freshness.get('collected_at', 'không rõ thời điểm')}); "
+            f"{estimated_station_count:,} trạm còn lại dùng ước tính station-hour. "
+            "Xem cột Nguồn tồn kho trên bản đồ trước khi điều phối."
+        )
+    elif live_station_count:
+        st.success(
+            f"Nguồn tồn kho: GBFS thời gian thực đã xác thực · "
+            f"{live_station_count:,} trạm · thu thập "
+            f"{gbfs_freshness.get('collected_at', 'không rõ thời điểm')}."
+        )
+    elif snapshot.empty:
+        st.warning(
+            "Không có metadata tọa độ trạm để hiển thị hoặc đối chiếu GBFS; "
+            "bản đồ chưa có tồn kho khả dụng."
+        )
+    elif gbfs_freshness.get("fresh_count", 0):
+        st.warning(
+            f"GBFS có {int(gbfs_freshness['fresh_count']):,} bản ghi mới và đã xác thực "
+            "nhưng không khớp station_id trong metadata bản đồ. "
+            "Bản đồ đang dùng tồn kho ước tính từ station-hour."
+        )
+    elif gbfs_freshness.get("state") == "stale":
+        st.warning(
+            f"{gbfs_freshness.get('message')} Bản đồ đang dùng tồn kho ước tính "
+            "từ station-hour; không dùng snapshot cũ để tính điều phối."
+        )
+    else:
+        st.warning(
+            f"{gbfs_freshness.get('message', 'Chưa có snapshot GBFS hợp lệ.')} "
+            "Bản đồ đang dùng tồn kho ước tính từ station-hour."
+        )
     tabs = st.tabs([
         "Use Case 07/09: 📍 Vận hành Real-time",
         "Use Case 08: 📊 Phân tích Dự báo",
@@ -833,9 +1062,20 @@ def main() -> None:
         "Use Case 14/15: 📈 Mô phỏng & Backtesting",
     ])
     with tabs[0]:
+        if estimated_station_count and snapshot_time.date() != pd.Timestamp.now().date():
+            st.info(
+                f"Các chỉ số tại mốc lịch sử {snapshot_time:%d/%m/%Y %H:%M} "
+                f"dùng {estimated_station_count:,} trạm fallback/ước tính từ station-hour; "
+                "đây không phải tồn kho thực tế của mốc lịch sử đó."
+            )
         c1, c2, c3, c4 = st.columns(4)
         with c1: metric_card("Tổng trạm", f"{len(snapshot)}", "Mạng lưới đang giám sát")
-        with c2: metric_card("Xe khả dụng", f"{snapshot.bikes_available.sum():,.0f}", "Tổng inventory", "#22C55E")
+        source_hint = (
+            f"{live_station_count:,} trạm GBFS · {estimated_station_count:,} trạm ước tính"
+            if live_station_count and estimated_station_count
+            else ("Nguồn GBFS thời gian thực" if live_station_count else "Nguồn ước tính từ station-hour")
+        )
+        with c2: metric_card("Xe khả dụng", f"{snapshot.bikes_available.sum():,.0f}", source_hint, "#22C55E")
         balance_rate = 0 if snapshot.empty else (snapshot.status == "Cân bằng").mean()
         with c3: metric_card("Tỷ lệ cân bằng", f"{balance_rate:.0%}", "Mục tiêu > 70%", "#38BDF8")
         with c4: metric_card("Cảnh báo", f"{(snapshot.status != 'Cân bằng').sum()}", "Cần hành động", "#F59E0B")
@@ -844,8 +1084,15 @@ def main() -> None:
         with right:
             st.subheader("Use Case 07: Stations cần chú ý")
             attention = snapshot[snapshot.status != "Cân bằng"].sort_values("utilization")
-            st.dataframe(attention[["station_name", "bikes_available", "capacity", "status"]].rename(
-                columns={"station_name": "Trạm", "bikes_available": "Xe", "capacity": "Sức chứa", "status": "Trạng thái"}),
+            detail_columns = ["station_name", "bikes_available", "capacity", "status", "inventory_source"]
+            st.dataframe(attention[detail_columns].rename(
+                columns={
+                    "station_name": "Trạm",
+                    "bikes_available": "Xe",
+                    "capacity": "Sức chứa",
+                    "status": "Trạng thái",
+                    "inventory_source": "Nguồn tồn kho",
+                }),
                 hide_index=True, use_container_width=True)
     with tabs[1]:
         if stations.empty:
@@ -1226,10 +1473,7 @@ def main() -> None:
                         persistent_state = _persist_use_case_result(
                             "uc2",
                             {
-                                "stats": {
-                                    key: int(value)
-                                    for key, value in cleaning_stats.items()
-                                },
+                                "stats": _json_ready(cleaning_stats),
                                 "preview": _frame_preview(cleaned_hourly),
                                 "artifacts": [
                                     "station_hour_cleaned.parquet",
@@ -1240,24 +1484,7 @@ def main() -> None:
                         st.success(
                             "Đã hoàn tất làm sạch dữ liệu và tạo lưới thời gian 24/7 thành công!"
                         )
-                        stat_columns = st.columns(3)
-                        stat_columns[0].metric(
-                            "Tổng số trạm đã chuẩn hóa",
-                            f"{cleaning_stats['station_count']:,}",
-                        )
-                        stat_columns[1].metric(
-                            "Bản ghi Station-Hour",
-                            f"{cleaning_stats['station_hour_rows']:,}",
-                        )
-                        stat_columns[2].metric(
-                            "Bản ghi bị loại",
-                            f"{cleaning_stats['removed_rows']:,}",
-                        )
-                        st.dataframe(
-                            cleaned_hourly.head(5),
-                            hide_index=True,
-                            use_container_width=True,
-                        )
+                        _render_uc2_audit(cleaning_stats, cleaned_hourly)
             uc2_state = persistent_state.get("uc2")
             if (
                 not clean_data_clicked
@@ -1266,25 +1493,10 @@ def main() -> None:
                 and (PROCESSED / "station_metadata.parquet").exists()
             ):
                 stats = uc2_state.get("stats", {})
+                if not isinstance(stats, dict):
+                    stats = {}
                 st.success("Use Case 02 đã khôi phục từ dữ liệu đã xử lý.")
-                stat_columns = st.columns(3)
-                stat_columns[0].metric(
-                    "Tổng số trạm đã chuẩn hóa",
-                    f"{int(stats.get('station_count', 0)):,}",
-                )
-                stat_columns[1].metric(
-                    "Bản ghi Station-Hour",
-                    f"{int(stats.get('station_hour_rows', 0)):,}",
-                )
-                stat_columns[2].metric(
-                    "Bản ghi bị loại",
-                    f"{int(stats.get('removed_rows', 0)):,}",
-                )
-                st.dataframe(
-                    _persisted_preview(uc2_state, "preview"),
-                    hide_index=True,
-                    use_container_width=True,
-                )
+                _render_uc2_audit(stats, _persisted_preview(uc2_state, "preview"))
             st.markdown("#### Use Case 03: GBFS Station Status Collector")
             collect_gbfs_clicked = st.button(
                 "Use Case 03: 🛰️ Kết nối GBFS & Thu thập Snapshot Trạm",
@@ -1296,7 +1508,10 @@ def main() -> None:
                 with st.spinner(
                     "Đang kết nối tới API GBFS công khai để lấy trạng thái tồn kho trạm thời gian thực..."
                 ):
-                    collector_result = run_gbfs_collector_job(DB_PATH)
+                    collector_result = run_gbfs_collector_job(
+                        DB_PATH,
+                        station_aliases=_load_station_aliases(),
+                    )
                 if collector_result["success"]:
                     snapshot_data = collector_result["status_df"]
                     persistent_state = _persist_use_case_result(
@@ -1304,27 +1519,12 @@ def main() -> None:
                         {
                             "records_count": int(collector_result["records_count"]),
                             "timestamp": collector_result["timestamp"],
+                            "warnings": collector_result.get("warnings"),
                             "preview": _frame_preview(snapshot_data),
                             "artifact": DB_PATH.name,
                         },
                     )
-                    st.success(
-                        "Đã thu thập và lưu trữ snapshot trạng thái trạm vào SQLite thành công!"
-                    )
-                    metric_columns = st.columns(2)
-                    metric_columns[0].metric(
-                        "Tổng số trạm đã cập nhật",
-                        f"{collector_result['records_count']:,}",
-                    )
-                    metric_columns[1].metric(
-                        "Thời điểm ghi nhận",
-                        str(collector_result["timestamp"]),
-                    )
-                    st.dataframe(
-                        snapshot_data.head(10),
-                        hide_index=True,
-                        use_container_width=True,
-                    )
+                    st.rerun()
                 else:
                     st.error(
                         f"{collector_result['message']} "
@@ -1337,10 +1537,12 @@ def main() -> None:
                 and DB_PATH.exists()
             ):
                 st.success(
-                    "Use Case 03 đã khôi phục snapshot GBFS gần nhất: "
+                    "Kết quả thu thập Use Case 03 đã lưu gần nhất: "
                     f"{int(uc3_state.get('records_count', 0)):,} trạm · "
                     f"{uc3_state.get('timestamp', 'Không rõ thời điểm')}."
                 )
+                if uc3_state.get("warnings"):
+                    st.warning(str(uc3_state["warnings"]))
                 st.dataframe(
                     _persisted_preview(uc3_state, "preview"),
                     hide_index=True,
