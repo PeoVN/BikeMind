@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import folium
+import duckdb
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -41,7 +42,11 @@ from src.data_loader import (
 from src.feature_engineering import build_features_pipeline, make_features, feature_columns
 from src.gbfs_collector import load_latest_station_status, run_gbfs_collector_job
 from src.model_trainer import benchmark_models, load_model, train_models
-from src.rebalancing_engine import generate_rebalancing_plan, run_greedy_rebalancing
+from src.rebalancing_engine import (
+    calculate_expected_inventory,
+    generate_rebalancing_plan,
+    run_greedy_rebalancing,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -60,6 +65,16 @@ USE_CASE_STATE_PATH = PROCESSED / "use_case_state.json"
 FEATURES_PATH = PROCESSED / "station_features.parquet"
 BENCHMARK_PATH = PROCESSED / "bikemind_benchmark.csv"
 BACKTESTING_PATH = PROCESSED / "bikemind_backtesting_report.csv"
+
+
+def _file_signature(path: Path | None) -> tuple[int, int]:
+    if path is None:
+        return 0, 0
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return 0, 0
+    return stat.st_mtime_ns, stat.st_size
 
 
 def _demo_data() -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -353,38 +368,137 @@ def render_data_status(status: dict[str, str], location: str) -> None:
         st.dataframe(details, hide_index=True, use_container_width=True)
 
 
-def _station_snapshot(hourly: pd.DataFrame, stations: pd.DataFrame, timestamp: pd.Timestamp) -> pd.DataFrame:
+def _safety_thresholds(safety_buffer: float) -> tuple[float, float, float]:
+    try:
+        buffer = float(safety_buffer)
+    except (TypeError, ValueError, OverflowError):
+        buffer = 0.15
+    if not math.isfinite(buffer):
+        buffer = 0.15
+    buffer = float(np.clip(buffer, 0.0, 0.5))
+    return buffer, max(0.0, 0.5 - buffer), min(1.0, 0.5 + buffer)
+
+
+def _classify_station_status(
+    snapshot: pd.DataFrame,
+    safety_buffer: float,
+) -> pd.DataFrame:
+    result = snapshot.copy()
+    _, lower_ratio, upper_ratio = _safety_thresholds(safety_buffer)
+    capacity = pd.to_numeric(
+        result.get("capacity", pd.Series(np.nan, index=result.index)),
+        errors="coerce",
+    )
+    inventory = pd.to_numeric(
+        result.get("bikes_available", pd.Series(np.nan, index=result.index)),
+        errors="coerce",
+    )
+    capacity_values = capacity.to_numpy(dtype=float, na_value=np.nan)
+    inventory_values = inventory.to_numpy(dtype=float, na_value=np.nan)
+    valid_capacity = np.isfinite(capacity_values) & (capacity_values > 0)
+    valid_inventory = np.isfinite(inventory_values) & (inventory_values >= 0)
+    valid = valid_capacity & valid_inventory & (inventory_values <= capacity_values)
+    safe_min = np.full(len(result), np.nan, dtype=float)
+    safe_max = np.full(len(result), np.nan, dtype=float)
+    safe_min[valid_capacity] = capacity_values[valid_capacity] * lower_ratio
+    safe_max[valid_capacity] = capacity_values[valid_capacity] * upper_ratio
+    utilization = np.full(len(result), np.nan, dtype=float)
+    utilization[valid] = inventory_values[valid] / capacity_values[valid]
+    status = np.full(len(result), "Thiếu dữ liệu", dtype=object)
+    status[valid & (inventory_values < safe_min)] = "Thiếu xe"
+    status[valid & (inventory_values > safe_max)] = "Đầy xe"
+    status[valid & (inventory_values >= safe_min) & (inventory_values <= safe_max)] = "Cân bằng"
+    result["utilization"] = utilization
+    result["safe_min_bikes"] = safe_min
+    result["safe_max_bikes"] = safe_max
+    result["safety_buffer_pct"] = _safety_thresholds(safety_buffer)[0] * 100
+    result["status"] = status
+    inventory_source = result.get(
+        "inventory_source", pd.Series("", index=result.index)
+    ).fillna("").astype(str)
+    capacity_source = result.get(
+        "capacity_source", pd.Series("", index=result.index)
+    ).fillna("").astype(str)
+    data_status = np.full(len(result), "Thiếu dữ liệu", dtype=object)
+    valid_rows = status != "Thiếu dữ liệu"
+    data_status[valid_rows & inventory_source.eq("Ước tính từ station-hour").to_numpy()] = (
+        "Ước tính từ station-hour"
+    )
+    live = inventory_source.eq("GBFS thời gian thực").to_numpy()
+    live_capacity = capacity_source.eq("GBFS station_information").to_numpy()
+    data_status[valid_rows & live & live_capacity] = "GBFS thực tế"
+    data_status[valid_rows & live & ~live_capacity] = (
+        "GBFS tồn kho · sức chứa từ metadata"
+    )
+    result["data_status"] = data_status
+    return result
+
+
+def _station_snapshot(
+    hourly: pd.DataFrame,
+    stations: pd.DataFrame,
+    timestamp: pd.Timestamp,
+    safety_buffer: float = 0.15,
+) -> pd.DataFrame:
     if stations.empty:
         return pd.DataFrame(
             columns=[
                 "station_id", "station_name", "lat", "lon", "capacity",
                 "pickups", "returns", "bikes_available", "utilization", "status",
+                "safe_min_bikes", "safe_max_bikes", "safety_buffer_pct",
+                "inventory_source", "capacity_source", "data_status",
+                "inventory_updated_at", "capacity_updated_at",
             ]
         )
-    latest = hourly.copy()
-    if "timestamp" not in latest or "station_id" not in latest:
+    latest = hourly.copy() if isinstance(hourly, pd.DataFrame) else pd.DataFrame()
+    required = {"timestamp", "station_id", "pickups", "returns"}
+    if not required.issubset(latest.columns):
         latest = pd.DataFrame(columns=["station_id", "pickups", "returns", "timestamp"])
-    latest["station_id"] = (
-        latest["station_id"].map(_normalize_station_id)
-    )
-    latest = latest[latest["timestamp"] <= timestamp].sort_values("timestamp").groupby("station_id").tail(1)
+    else:
+        latest["station_id"] = latest["station_id"].map(_normalize_station_id)
+        latest["timestamp"] = pd.to_datetime(latest["timestamp"], errors="coerce")
+        latest = latest.dropna(subset=["timestamp"])
+        latest = latest.loc[latest["timestamp"] <= pd.Timestamp(timestamp)]
+        latest = latest.sort_values("timestamp").groupby("station_id").tail(1)
     result = stations.copy()
-    result["station_id"] = (
-        result["station_id"].map(_normalize_station_id)
+    result["station_id"] = result["station_id"].map(_normalize_station_id)
+    result["capacity"] = pd.to_numeric(result["capacity"], errors="coerce")
+    result = result.merge(
+        latest[["station_id", "pickups", "returns", "timestamp"]],
+        on="station_id",
+        how="left",
+        validate="many_to_one",
+    ).rename(columns={"timestamp": "inventory_updated_at"})
+    result["pickups"] = pd.to_numeric(result["pickups"], errors="coerce")
+    result["returns"] = pd.to_numeric(result["returns"], errors="coerce")
+    result["inventory_updated_at"] = pd.to_datetime(
+        result["inventory_updated_at"], errors="coerce", utc=True
     )
-    result = result.merge(latest[["station_id", "pickups", "returns"]], on="station_id", how="left").fillna(0)
-    result["bikes_available"] = (result["capacity"] * 0.55 + result["returns"] - result["pickups"]).clip(0, result["capacity"])
-    result["utilization"] = result["bikes_available"] / result["capacity"]
-    result["status"] = np.select([result["utilization"] < 0.25, result["utilization"] > 0.8],
-                                  ["Thiếu xe", "Đầy xe"], default="Cân bằng")
-    return result
+    result["capacity_updated_at"] = pd.NaT
+    valid_capacity = (
+        np.isfinite(result["capacity"].to_numpy(dtype=float, na_value=np.nan))
+        & result["capacity"].gt(0).to_numpy()
+    )
+    valid_flows = np.isfinite(
+        result[["pickups", "returns"]].to_numpy(dtype=float, na_value=np.nan)
+    ).all(axis=1) & result["pickups"].ge(0).to_numpy() & result["returns"].ge(0).to_numpy()
+    valid_estimate = valid_capacity & valid_flows
+    result["bikes_available"] = np.nan
+    result.loc[valid_estimate, "bikes_available"] = (
+        result.loc[valid_estimate, "capacity"] * 0.55
+        + result.loc[valid_estimate, "returns"]
+        - result.loc[valid_estimate, "pickups"]
+    ).clip(lower=0, upper=result.loc[valid_estimate, "capacity"])
+    return _classify_station_status(result, safety_buffer)
 
 
-def _query_station_snapshot(timestamp: pd.Timestamp, stations: pd.DataFrame) -> pd.DataFrame:
+def _query_station_snapshot(
+    timestamp: pd.Timestamp,
+    stations: pd.DataFrame,
+    safety_buffer: float = 0.15,
+) -> pd.DataFrame:
     latest = query_station_snapshot(PROCESSED, timestamp)
-    if latest.empty:
-        return _station_snapshot(pd.DataFrame(), stations, timestamp)
-    return _station_snapshot(latest, stations, timestamp)
+    return _station_snapshot(latest, stations, timestamp, safety_buffer)
 
 
 def _normalize_station_id(value: object) -> str:
@@ -428,19 +542,24 @@ def _load_station_aliases() -> dict[str, str]:
 def _overlay_gbfs_snapshot(
     estimated: pd.DataFrame,
     gbfs_status: pd.DataFrame,
+    safety_buffer: float = 0.15,
 ) -> pd.DataFrame:
     """Use only fresh, identity-matched GBFS rows; label all estimated rows."""
     result = estimated.copy()
     if result.empty:
-        return result
+        return _classify_station_status(result, safety_buffer)
     result["inventory_source"] = "Ước tính từ station-hour"
     result["capacity_source"] = "Ước tính từ station_metadata"
+    if "inventory_updated_at" not in result.columns:
+        result["inventory_updated_at"] = pd.NaT
+    if "capacity_updated_at" not in result.columns:
+        result["capacity_updated_at"] = pd.NaT
     if gbfs_status.empty or "is_usable" not in gbfs_status.columns:
-        return result
+        return _classify_station_status(result, safety_buffer)
 
     live = gbfs_status.loc[gbfs_status["is_usable"]].copy()
     if live.empty:
-        return result
+        return _classify_station_status(result, safety_buffer)
     aliases = _load_station_aliases()
     if "station_id_alias" in result.columns:
         for alias, canonical in result[["station_id_alias", "station_id"]].dropna().astype(str).itertuples(index=False, name=None):
@@ -461,7 +580,7 @@ def _overlay_gbfs_snapshot(
     live = live.drop_duplicates("station_id", keep="last").set_index("station_id")
     live_ids = result["station_id"].isin(live.index)
     if not live_ids.any():
-        return result
+        return _classify_station_status(result, safety_buffer)
 
     live_bikes = result["station_id"].map(live["bikes_available"])
     result.loc[live_ids, "bikes_available"] = live_bikes.loc[live_ids].astype(float)
@@ -472,6 +591,12 @@ def _overlay_gbfs_snapshot(
             use_live_capacity
         ].astype(float)
         result.loc[use_live_capacity, "capacity_source"] = "GBFS station_information"
+        if "timestamp" in live:
+            result.loc[use_live_capacity, "capacity_updated_at"] = pd.to_datetime(
+                result.loc[use_live_capacity, "station_id"].map(live["timestamp"]),
+                errors="coerce",
+                utc=True,
+            )
     if "station_name" in live:
         live_names = result["station_id"].map(live["station_name"])
         use_live_name = live_ids & live_names.notna() & live_names.astype(str).str.strip().ne("")
@@ -479,16 +604,13 @@ def _overlay_gbfs_snapshot(
     result.loc[live_ids, "pickups"] = np.nan
     result.loc[live_ids, "returns"] = np.nan
     result.loc[live_ids, "inventory_source"] = "GBFS thời gian thực"
-    result["utilization"] = result["bikes_available"] / result["capacity"].replace(0, np.nan)
-    result["status"] = np.select(
-        [
-            result["utilization"] < 0.25,
-            result["utilization"] > 0.8,
-        ],
-        ["Thiếu xe", "Đầy xe"],
-        default="Cân bằng",
-    )
-    return result
+    if "timestamp" in live:
+        result.loc[live_ids, "inventory_updated_at"] = pd.to_datetime(
+            result.loc[live_ids, "station_id"].map(live["timestamp"]),
+            errors="coerce",
+            utc=True,
+        )
+    return _classify_station_status(result, safety_buffer)
 
 
 def _status_color(status: str) -> str:
@@ -496,7 +618,27 @@ def _status_color(status: str) -> str:
 
 
 def render_map(snapshot: pd.DataFrame, plan: pd.DataFrame | None = None, height: int = 570) -> None:
-    center = [snapshot["lat"].mean(), snapshot["lon"].mean()] if not snapshot.empty else [40.74, -73.99]
+    valid_snapshot = snapshot.copy()
+    if {"lat", "lon"}.issubset(valid_snapshot.columns):
+        valid_snapshot["lat"] = pd.to_numeric(valid_snapshot["lat"], errors="coerce")
+        valid_snapshot["lon"] = pd.to_numeric(valid_snapshot["lon"], errors="coerce")
+        valid_coordinates = (
+            np.isfinite(
+                valid_snapshot[["lat", "lon"]].to_numpy(
+                    dtype=float, na_value=np.nan
+                )
+            ).all(axis=1)
+            & valid_snapshot["lat"].between(-90, 90).to_numpy()
+            & valid_snapshot["lon"].between(-180, 180).to_numpy()
+        )
+        valid_snapshot = valid_snapshot.loc[valid_coordinates].copy()
+    else:
+        valid_snapshot = valid_snapshot.iloc[0:0].copy()
+    center = (
+        [valid_snapshot["lat"].mean(), valid_snapshot["lon"].mean()]
+        if not valid_snapshot.empty
+        else [40.74, -73.99]
+    )
     fmap = folium.Map(
         location=center,
         zoom_start=12,
@@ -505,7 +647,7 @@ def render_map(snapshot: pd.DataFrame, plan: pd.DataFrame | None = None, height:
         control_scale=True,
     )
     Fullscreen(position="topright").add_to(fmap)
-    for row in snapshot.to_dict("records"):
+    for row in valid_snapshot.to_dict("records"):
         pickups = "—" if pd.isna(row["pickups"]) else f"{row['pickups']:.0f}"
         returns = "—" if pd.isna(row["returns"]) else f"{row['returns']:.0f}"
         source = row.get("inventory_source", "Không rõ nguồn")
@@ -517,27 +659,359 @@ def render_map(snapshot: pd.DataFrame, plan: pd.DataFrame | None = None, height:
                             fill=True, fill_color=_status_color(row["status"]), fill_opacity=0.9,
                             tooltip=f"{row['station_name']} · {row['status']}", popup=popup).add_to(fmap)
     if plan is not None and not plan.empty:
-        lookup = (
-            snapshot
+        lookup_by_id = {}
+        if "station_id" in valid_snapshot.columns:
+            lookup_by_id = (
+                valid_snapshot
+                .drop_duplicates(subset=["station_id"], keep="last")
+                .set_index("station_id")[["lat", "lon"]]
+                .to_dict("index")
+            )
+        lookup_by_name = (
+            valid_snapshot
             .drop_duplicates(subset=["station_name"], keep="last")
             .set_index("station_name")[["lat", "lon"]]
             .to_dict("index")
         )
         for row in plan.to_dict("records"):
-            if row["from_station"] in lookup and row["to_station"] in lookup:
-                folium.PolyLine([(lookup[row["from_station"]]["lat"], lookup[row["from_station"]]["lon"]),
-                                 (lookup[row["to_station"]]["lat"], lookup[row["to_station"]]["lon"])],
+            from_location = lookup_by_id.get(row.get("from_station_id"))
+            to_location = lookup_by_id.get(row.get("to_station_id"))
+            if from_location is None:
+                from_location = lookup_by_name.get(row["from_station"])
+            if to_location is None:
+                to_location = lookup_by_name.get(row["to_station"])
+            if from_location is not None and to_location is not None:
+                folium.PolyLine([(from_location["lat"], from_location["lon"]),
+                                 (to_location["lat"], to_location["lon"])],
                                 color="#F59E0B", weight=4, opacity=0.9,
                                 tooltip=f"{row['bikes']} xe · {row['distance_km']} km").add_to(fmap)
     st_folium(fmap, height=height, use_container_width=True, returned_objects=[])
 
 
 def log_decision(action: str, plan: pd.DataFrame) -> None:
-    with sqlite3.connect(DB_PATH) as connection:
+    unmatched = pd.DataFrame(plan.attrs.get("unmatched_stations", []))
+    payload = {
+        "schema_version": 2,
+        "routes": json.loads(plan.to_json(orient="records", date_format="iso")),
+        "summary": plan.attrs.get("summary", {}),
+        "unmatched_stations": json.loads(
+            unmatched.to_json(orient="records", date_format="iso")
+        ),
+        "generation": plan.attrs.get("generation", {}),
+    }
+    database_path = Path(DB_PATH).expanduser().resolve()
+    with sqlite3.connect(database_path) as connection:
         connection.execute("CREATE TABLE IF NOT EXISTS decision_log (created_at TEXT, action TEXT, payload TEXT)")
         connection.execute("INSERT INTO decision_log VALUES (?, ?, ?)",
-                           (datetime.now().isoformat(timespec="seconds"), action, plan.to_json(orient="records")))
+                           (
+                               datetime.now().isoformat(timespec="seconds"),
+                               action,
+                               json.dumps(payload, ensure_ascii=False, default=str),
+                           ))
         connection.commit()
+
+
+def _station_hour_source_path() -> Path | None:
+    return next(
+        (
+            path.resolve()
+            for path in (
+                PROCESSED / "station_hour_cleaned.parquet",
+                PROCESSED / "station_hour_cleaned.csv",
+            )
+            if path.is_file()
+        ),
+        None,
+    )
+
+
+@st.cache_data(show_spinner=False)
+def _cached_uc010_forecasts(
+    fallback_history_json: str,
+    source_path: str,
+    selected_time: str,
+    station_ids_json: str,
+    source_mtime_ns: int,
+    source_size: int,
+    alias_mtime_ns: int,
+    alias_size: int,
+    pickups_model_mtime_ns: int,
+    pickups_model_size: int,
+    returns_model_mtime_ns: int,
+    returns_model_size: int,
+) -> pd.DataFrame:
+    del (
+        source_mtime_ns,
+        source_size,
+        alias_mtime_ns,
+        alias_size,
+        pickups_model_mtime_ns,
+        pickups_model_size,
+        returns_model_mtime_ns,
+        returns_model_size,
+    )
+    selected = pd.Timestamp(selected_time)
+    forecast_time = selected + pd.Timedelta(hours=1)
+    station_ids = [str(value) for value in json.loads(station_ids_json)]
+    result = pd.DataFrame({"station_id": station_ids})
+    for column in ("forecast_pickups", "forecast_returns"):
+        result[column] = np.nan
+    for column in ("forecast_pickups_source", "forecast_returns_source"):
+        result[column] = "Thiếu dữ liệu tại mốc gốc"
+    result["forecast_updated_at"] = forecast_time
+    result["forecast_data_updated_at"] = pd.NaT
+    if not station_ids:
+        return result
+
+    if source_path:
+        source = Path(source_path).expanduser().resolve()
+        if not source.is_file():
+            raise FileNotFoundError(f"Không tìm thấy dữ liệu station-hour: {source}")
+        source_reader = (
+            "read_parquet(?)"
+            if source.suffix.lower() == ".parquet"
+            else "read_csv_auto(?)"
+        )
+        history_start = selected - pd.Timedelta(hours=240)
+        connection = duckdb.connect()
+        try:
+            history = connection.execute(
+                f"""
+                SELECT timestamp, CAST(station_id AS VARCHAR) AS station_id,
+                       pickups, returns
+                FROM (
+                    SELECT timestamp, station_id, pickups, returns,
+                           row_number() OVER (
+                               PARTITION BY CAST(station_id AS VARCHAR)
+                               ORDER BY timestamp DESC
+                           ) AS history_rank
+                    FROM {source_reader}
+                    WHERE timestamp >= ? AND timestamp <= ?
+                )
+                WHERE history_rank <= 240
+                ORDER BY station_id, timestamp
+                """,
+                [
+                    str(source),
+                    history_start.to_pydatetime(),
+                    selected.to_pydatetime(),
+                ],
+            ).df()
+        finally:
+            connection.close()
+    else:
+        history = pd.DataFrame.from_records(
+            json.loads(fallback_history_json or "[]")
+        )
+        if "datetime_hour" in history.columns and "timestamp" not in history.columns:
+            history = history.rename(columns={"datetime_hour": "timestamp"})
+
+    required = {"timestamp", "station_id", "pickups", "returns"}
+    if history.empty or not required.issubset(history.columns):
+        return result
+
+    history = history.loc[:, ["timestamp", "station_id", "pickups", "returns"]].copy()
+    history["station_id"] = history["station_id"].map(_normalize_station_id)
+    aliases = _load_station_aliases()
+    if aliases:
+        history["station_id"] = history["station_id"].map(
+            lambda value: aliases.get(value, value)
+        )
+    history["timestamp"] = pd.to_datetime(history["timestamp"], errors="coerce")
+    try:
+        source_timezone = history["timestamp"].dt.tz
+    except (AttributeError, TypeError, ValueError):
+        history["timestamp"] = pd.to_datetime(history["timestamp"], errors="coerce", utc=True)
+        source_timezone = history["timestamp"].dt.tz
+    if source_timezone is None:
+        selected = selected.tz_localize(None) if selected.tzinfo else selected
+    elif selected.tzinfo is None:
+        selected = selected.tz_localize(source_timezone)
+    else:
+        selected = selected.tz_convert(source_timezone)
+    forecast_time = selected + pd.Timedelta(hours=1)
+    result["forecast_updated_at"] = forecast_time
+
+    history["pickups"] = pd.to_numeric(history["pickups"], errors="coerce")
+    history["returns"] = pd.to_numeric(history["returns"], errors="coerce")
+    finite_flows = np.isfinite(
+        history[["pickups", "returns"]].to_numpy(dtype=float, na_value=np.nan)
+    ).all(axis=1)
+    valid_history = history.loc[
+        history["station_id"].isin(station_ids)
+        & history["timestamp"].notna()
+        & history["timestamp"].le(selected)
+        & finite_flows
+        & history["pickups"].ge(0)
+        & history["returns"].ge(0)
+    ].copy()
+    valid_history = (
+        valid_history.sort_values("timestamp")
+        .drop_duplicates(["station_id", "timestamp"], keep="last")
+        .groupby("station_id", sort=False, group_keys=False)
+        .tail(240)
+    )
+    origins = valid_history.loc[valid_history["timestamp"].eq(selected)].copy()
+    if origins.empty:
+        for column in ("forecast_pickups_source", "forecast_returns_source"):
+            result[column] = "Không có dữ liệu gốc hợp lệ"
+        return result
+
+    origin_ids = origins["station_id"].drop_duplicates().tolist()
+    future_rows = origins.copy()
+    future_rows["timestamp"] = forecast_time
+    feature_rows = make_features(
+        pd.concat(
+            [
+                valid_history.loc[valid_history["station_id"].isin(origin_ids)],
+                future_rows,
+            ],
+            ignore_index=True,
+        ),
+        drop_missing=False,
+    )
+    future_features = (
+        feature_rows.loc[feature_rows["timestamp"].eq(forecast_time)]
+        .drop_duplicates("station_id", keep="last")
+        .set_index("station_id")
+    )
+    if future_features.empty:
+        return result
+
+    output = result.set_index("station_id")
+    output.loc[origins["station_id"], "forecast_data_updated_at"] = selected
+    for target in ("pickups", "returns"):
+        output_column = f"forecast_{target}"
+        source_column = f"forecast_{target}_source"
+        model_path = MODELS / f"lgb_{target}.pkl"
+        fallback_source = (
+            "Ước tính heuristic (model không khả dụng)"
+            if model_path.is_file()
+            else "Ước tính heuristic (model chưa có)"
+        )
+        predictions_by_id = pd.Series(dtype="float64")
+        prediction_source = fallback_source
+        if model_path.is_file():
+            try:
+                bundle = load_model(model_path)
+                features = bundle.get("features") if isinstance(bundle, dict) else None
+                if (
+                    not isinstance(features, (list, tuple))
+                    or not features
+                    or any(column not in future_features.columns for column in features)
+                ):
+                    raise ValueError("Bundle model thiếu danh sách feature hợp lệ.")
+                sample = future_features.loc[:, list(features)]
+                sample_values = sample.to_numpy(dtype=float)
+                valid_sample = np.isfinite(sample_values).all(axis=1)
+                if valid_sample.any():
+                    predictions = np.asarray(
+                        bundle["model"].predict(sample.loc[valid_sample]),
+                        dtype=float,
+                    ).reshape(-1)
+                    if predictions.size != int(valid_sample.sum()):
+                        raise ValueError("Model trả về số dự báo không khớp số trạm.")
+                    predictions[~np.isfinite(predictions)] = np.nan
+                    predictions_by_id = pd.Series(
+                        np.maximum(predictions, 0),
+                        index=sample.index[valid_sample],
+                        dtype="float64",
+                    ).dropna()
+                    prediction_source = "LightGBM · t+1"
+            except (
+                OSError,
+                ValueError,
+                KeyError,
+                AttributeError,
+                TypeError,
+                ImportError,
+            ) as exc:
+                fallback_source = (
+                    "Ước tính heuristic (model lỗi: "
+                    f"{type(exc).__name__})"
+                )
+                prediction_source = fallback_source
+
+        rolling = pd.to_numeric(
+            future_features.get(
+                f"{target}_rolling_3h",
+                pd.Series(np.nan, index=future_features.index),
+            ),
+            errors="coerce",
+        )
+        multiplier = 1.05 if target == "pickups" else 0.95
+        for station_id in future_features.index:
+            prediction = predictions_by_id.get(station_id, np.nan)
+            source_label = prediction_source
+            if not np.isfinite(prediction):
+                rolling_value = rolling.get(station_id, np.nan)
+                if np.isfinite(rolling_value):
+                    prediction = max(0.0, float(rolling_value) * multiplier)
+                    source_label = fallback_source
+                else:
+                    source_label = "Không đủ dữ liệu lịch sử"
+            output.loc[station_id, output_column] = prediction
+            output.loc[station_id, source_column] = source_label
+    return output.reset_index()
+
+
+def _uc010_forecasts(
+    hourly: pd.DataFrame,
+    snapshot: pd.DataFrame,
+    selected_time: pd.Timestamp,
+) -> pd.DataFrame:
+    if snapshot.empty or "station_id" not in snapshot.columns:
+        return pd.DataFrame(
+            columns=[
+                "station_id", "forecast_pickups", "forecast_returns",
+                "forecast_pickups_source", "forecast_returns_source",
+                "forecast_updated_at", "forecast_data_updated_at",
+            ]
+        )
+    station_ids = sorted({
+        _normalize_station_id(value)
+        for value in snapshot["station_id"]
+        if _normalize_station_id(value)
+    })
+    source = next(
+        (
+            path.resolve()
+            for path in (
+                PROCESSED / "station_hour_cleaned.parquet",
+                PROCESSED / "station_hour_cleaned.csv",
+            )
+            if path.is_file()
+        ),
+        None,
+    )
+    fallback_json = (
+        "[]"
+        if source is not None
+        else hourly.to_json(orient="records", date_format="iso", default_handler=str)
+    )
+    alias_path = PROCESSED / "station_id_aliases.json"
+    pickups_model = MODELS / "lgb_pickups.pkl"
+    returns_model = MODELS / "lgb_returns.pkl"
+    return _cached_uc010_forecasts(
+        fallback_json,
+        str(source) if source is not None else "",
+        pd.Timestamp(selected_time).isoformat(),
+        json.dumps(station_ids),
+        *_file_signature(source),
+        *_file_signature(alias_path),
+        *_file_signature(pickups_model),
+        *_file_signature(returns_model),
+    )
+
+
+@st.cache_data(show_spinner=False)
+def _cached_uc010_analysis(
+    planning_snapshot: pd.DataFrame,
+    safety_buffer: float,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    projected = calculate_expected_inventory(planning_snapshot, safety_buffer)
+    plan = run_greedy_rebalancing(planning_snapshot, buffer_pct=safety_buffer)
+    return projected, plan
 
 
 def build_forecast_table(hourly: pd.DataFrame, station_id: str, selected_time: pd.Timestamp) -> pd.DataFrame:
@@ -988,10 +1462,16 @@ def main() -> None:
         safety = st.slider("Safety Buffer (%)", 0, 50, 15) / 100
         snapshot_time = pd.Timestamp(selected_date) + pd.Timedelta(hours=selected_hour)
         if data_source.startswith("Demo"):
-            estimated_snapshot = _station_snapshot(hourly, stations, snapshot_time)
+            estimated_snapshot = _station_snapshot(
+                hourly, stations, snapshot_time, safety
+            )
         else:
-            estimated_snapshot = _query_station_snapshot(snapshot_time, stations)
-        snapshot = _overlay_gbfs_snapshot(estimated_snapshot, gbfs_status)
+            estimated_snapshot = _query_station_snapshot(
+                snapshot_time, stations, safety
+            )
+        snapshot = _overlay_gbfs_snapshot(
+            estimated_snapshot, gbfs_status, safety
+        )
         live_station_count = (
             int((snapshot["inventory_source"] == "GBFS thời gian thực").sum())
             if "inventory_source" in snapshot
@@ -1111,27 +1591,232 @@ def main() -> None:
                     use_container_width=True,
                 )
     with tabs[2]:
-        planning_snapshot = snapshot.copy()
-        if not planning_snapshot.empty:
-            planning_snapshot["forecast_pickups"] = planning_snapshot["pickups"]
-            planning_snapshot["forecast_returns"] = planning_snapshot["returns"]
-        plan = run_greedy_rebalancing(planning_snapshot, buffer_pct=safety) if not planning_snapshot.empty else pd.DataFrame()
-        st.subheader("Use Case 10/11: Lịch trình xe tải · Gom → Rải")
+        st.subheader("Use Case 10: Tồn kho dự kiến & mất cân bằng")
+        st.caption(
+            "Tồn kho cuối khung giờ = tồn kho đầu kỳ − dự báo lượt lấy + dự báo lượt trả; "
+            "dự báo chỉ cho t+1. Vùng an toàn dùng cùng Safety Buffer với UC009."
+        )
         if snapshot.empty:
-            st.info("Không có dữ liệu")
-        elif plan.empty:
-            st.success("Mạng lưới hiện cân bằng, chưa cần điều phối.")
+            st.info("Không có dữ liệu trạm để tính tồn kho dự kiến.")
         else:
-            a, b = st.columns([1.5, 1])
-            with a: st.dataframe(plan, hide_index=True, use_container_width=True)
-            with b:
-                metric_card("Tổng xe điều phối", f"{plan.bikes.sum():.0f}", f"{len(plan)} chặng")
-                metric_card("Quãng đường", f"{plan.distance_km.sum():.1f} km", "Greedy Haversine", "#F59E0B")
-                if st.button("Use Case 12: ✅ Phê duyệt Lệnh", type="primary", use_container_width=True):
-                    log_decision("APPROVED", plan); st.success("Đã ghi nhận lệnh điều phối.")
-                if st.button("Use Case 12: ❌ Từ chối", use_container_width=True):
-                    log_decision("REJECTED", plan); st.warning("Lệnh đã bị từ chối.")
-            render_map(snapshot, plan)
+            try:
+                planning_base = (
+                    estimated_snapshot
+                    if snapshot_time < pd.Timestamp.now().floor("h")
+                    else snapshot
+                )
+                forecasts = _uc010_forecasts(hourly, planning_base, snapshot_time)
+                planning_snapshot = planning_base.drop(
+                    columns=[
+                        "forecast_pickups",
+                        "forecast_returns",
+                        "forecast_pickups_source",
+                        "forecast_returns_source",
+                    ],
+                    errors="ignore",
+                ).merge(forecasts, on="station_id", how="left", validate="one_to_one")
+                projected, plan = _cached_uc010_analysis(
+                    planning_snapshot,
+                    safety,
+                )
+            except (
+                duckdb.Error,
+                ImportError,
+                OSError,
+                ValueError,
+                RuntimeError,
+                MemoryError,
+            ) as exc:
+                projected = pd.DataFrame()
+                plan = pd.DataFrame(columns=[
+                    "route", "from_station", "to_station", "bikes",
+                        "distance_km", "priority",
+                ])
+                st.error(f"Không thể tính tồn kho dự kiến hoặc lịch trình: {exc}")
+
+            if not projected.empty:
+                projectable = projected["data_quality"].eq("Đủ dữ liệu")
+                incomplete_count = int((~projectable).sum())
+                estimated_count = int(projected["projection_is_estimated"].sum())
+                unbalanced_count = int(
+                    projected["imbalance_status"].isin(["Thiếu xe", "Dư xe"]).sum()
+                )
+                st.caption(
+                    f"Mốc tồn kho: {snapshot_time:%d/%m/%Y %H:%M} · "
+                    f"mốc dự báo: {snapshot_time + pd.Timedelta(hours=1):%d/%m/%Y %H:%M} · "
+                    f"Safety Buffer: {safety:.0%} · "
+                    f"{projectable.sum():,}/{len(projected):,} trạm đủ đầu vào."
+                )
+                if incomplete_count:
+                    st.warning(
+                        f"{incomplete_count:,} trạm thiếu hoặc có dữ liệu đầu vào không hợp lệ; "
+                        "không được phân loại mất cân bằng hay đưa vào lịch điều phối."
+                    )
+                if estimated_count:
+                    st.info(
+                        f"{estimated_count:,} trạm có tồn kho đầu kỳ hoặc sức chứa ước tính/fallback "
+                        "hoặc chưa xác thực nguồn. Nguồn và thời điểm cập nhật được hiển thị trong bảng."
+                    )
+
+                projection_columns = [
+                    "station_id",
+                    "station_name",
+                    "bikes_available",
+                    "forecast_pickups",
+                    "forecast_returns",
+                    "expected_stock",
+                    "safe_min_bikes",
+                    "safe_max_bikes",
+                    "imbalance_status",
+                    "data_quality",
+                    "projection_is_estimated",
+                    "inventory_is_estimated",
+                    "capacity_is_estimated",
+                    "projection_adjusted",
+                    "inventory_source",
+                    "capacity_source",
+                    "capacity_updated_at",
+                    "forecast_pickups_source",
+                    "forecast_returns_source",
+                    "inventory_updated_at",
+                    "forecast_data_updated_at",
+                    "forecast_updated_at",
+                ]
+                projection_columns = [
+                    column for column in projection_columns if column in projected.columns
+                ]
+                projection_labels = {
+                    "station_id": "Mã trạm",
+                    "station_name": "Trạm",
+                    "bikes_available": "Tồn đầu kỳ",
+                    "forecast_pickups": "Dự báo lấy",
+                    "forecast_returns": "Dự báo trả",
+                    "expected_stock": "Tồn cuối kỳ",
+                    "safe_min_bikes": "Ngưỡng thiếu",
+                    "safe_max_bikes": "Ngưỡng dư",
+                    "imbalance_status": "Mất cân bằng",
+                    "data_quality": "Chất lượng đầu vào",
+                    "projection_is_estimated": "Có dữ liệu ước tính",
+                    "inventory_is_estimated": "Tồn đầu kỳ ước tính",
+                    "capacity_is_estimated": "Sức chứa ước tính",
+                    "projection_adjusted": "Đã chặn theo biên",
+                    "inventory_source": "Nguồn tồn đầu kỳ",
+                    "capacity_source": "Nguồn sức chứa",
+                    "capacity_updated_at": "Cập nhật sức chứa",
+                    "forecast_pickups_source": "Nguồn dự báo lấy",
+                    "forecast_returns_source": "Nguồn dự báo trả",
+                    "inventory_updated_at": "Cập nhật tồn đầu kỳ",
+                    "forecast_data_updated_at": "Cập nhật station-hour",
+                    "forecast_updated_at": "Mốc dự báo",
+                }
+                with st.expander(
+                    "Use Case 10: Tồn kho dự kiến và trạng thái từng trạm",
+                    expanded=True,
+                ):
+                    st.dataframe(
+                        projected[projection_columns].rename(
+                            columns=projection_labels
+                        ),
+                        hide_index=True,
+                        use_container_width=True,
+                        height=360,
+                    )
+
+                st.subheader("Use Case 10/11: Lịch trình xe tải · Gom → Rải")
+                unmatched = pd.DataFrame(
+                    plan.attrs.get("unmatched_stations", [])
+                )
+                if not unmatched.empty:
+                    unmatched_labels = {
+                        "station_id": "Mã trạm",
+                        "station_name": "Trạm",
+                        "imbalance_status": "Trạng thái",
+                        "remaining_surplus": "Xe dư chưa ghép",
+                        "remaining_deficit": "Nhu cầu thiếu chưa ghép",
+                        "reason": "Lý do",
+                        "data_source": "Nguồn dữ liệu",
+                        "updated_at": "Thời điểm cập nhật",
+                        "uses_estimated_data": "Có dữ liệu ước tính",
+                    }
+                    st.warning(
+                        f"Còn {len(unmatched):,} trạm chưa ghép hết; lượng dư/thiếu này "
+                        "không được tính vào tổng xe đã lập lịch."
+                    )
+                    st.dataframe(
+                        unmatched.rename(columns=unmatched_labels),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+                if not projectable.any():
+                    st.warning(
+                        "Chưa đủ dự báo, tồn kho đầu kỳ hoặc sức chứa hợp lệ để lập lịch điều phối."
+                    )
+                elif plan.empty and unbalanced_count:
+                    st.warning(
+                        f"Phát hiện {unbalanced_count:,} trạm mất cân bằng nhưng chưa tạo được "
+                        "tuyến khả thi; các trạm còn lại được liệt kê ở bảng chưa ghép."
+                    )
+                elif plan.empty:
+                    st.success("Các trạm đủ dữ liệu hiện nằm trong vùng an toàn.")
+                else:
+                    a, b = st.columns([1.5, 1])
+                    with a:
+                        plan_labels = {
+                            "route": "Tuyến",
+                            "from_station": "Trạm nguồn",
+                            "from_station_id": "Mã trạm nguồn",
+                            "to_station": "Trạm đích",
+                            "to_station_id": "Mã trạm đích",
+                            "bikes": "Số xe",
+                            "distance_km": "Khoảng cách (km)",
+                            "priority": "Ưu tiên",
+                            "from_data_source": "Nguồn dữ liệu trạm nguồn",
+                            "to_data_source": "Nguồn dữ liệu trạm đích",
+                            "from_updated_at": "Cập nhật trạm nguồn",
+                            "to_updated_at": "Cập nhật trạm đích",
+                            "uses_estimated_data": "Có dữ liệu ước tính",
+                        }
+                        st.dataframe(
+                            plan.rename(columns=plan_labels),
+                            hide_index=True,
+                            use_container_width=True,
+                        )
+                    with b:
+                        metric_card(
+                            "Tổng xe điều phối",
+                            f"{plan.bikes.sum():.0f}",
+                            f"{len(plan)} chặng",
+                        )
+                        metric_card(
+                            "Quãng đường",
+                            f"{plan.distance_km.sum():.1f} km",
+                            "Greedy Haversine",
+                            "#F59E0B",
+                        )
+                        summary = plan.attrs.get("summary", {})
+                        metric_card(
+                            "Xe dư / thiếu chưa ghép",
+                            f"{summary.get('unmatched_surplus', 0):,} / "
+                            f"{summary.get('unmatched_deficit', 0):,}",
+                            f"{summary.get('unmatched_station_count', 0):,} trạm",
+                            "#EF4444",
+                        )
+                        if st.button(
+                            "Use Case 12: ✅ Phê duyệt Lệnh",
+                            type="primary",
+                            use_container_width=True,
+                        ):
+                            log_decision("APPROVED", plan)
+                            st.success("Đã ghi nhận lệnh điều phối.")
+                        if st.button(
+                            "Use Case 12: ❌ Từ chối",
+                            use_container_width=True,
+                        ):
+                            log_decision("REJECTED", plan)
+                            st.warning("Lệnh đã bị từ chối.")
+                    render_map(planning_base, plan)
+            else:
+                st.warning("Không có kết quả dự kiến khả dụng.")
         st.markdown('<div class="section-card"><b>Use Case 13: 💡 Incentive gợi ý</b><br>Thưởng +15 điểm cho người dùng trả xe tại các trạm đang thiếu xe trong 60 phút tới.</div>', unsafe_allow_html=True)
     with tabs[3]:
         st.subheader("Use Case 01-06: ⚙️ Quản trị Backend & AI")
