@@ -120,7 +120,7 @@ def make_features(hourly: pd.DataFrame, drop_missing: bool = True) -> pd.DataFra
         )
     frame["timestamp"] = frame["datetime_hour"]
     frame["hour"] = frame["datetime_hour"].dt.hour
-    frame["day_of_week"] = frame["datetime_hour"].dt.dayofweek
+    frame["day_of_week"] = frame["datetime_hour"].dt.day_of_week
     frame["is_weekend"] = (frame["day_of_week"] >= 5).astype(int)
     frame["month"] = frame["datetime_hour"].dt.month
     frame["is_peak_hour"] = frame["hour"].isin([7, 8, 9, 17, 18, 19]).astype(int)

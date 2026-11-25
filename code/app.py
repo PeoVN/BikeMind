@@ -87,6 +87,21 @@ _UC013_EXECUTION_CSV_COLUMNS = [
     "is_estimated",
     "updated_at",
 ]
+STATUS_COLORS = {
+    "Thiếu xe": "#DC2626",
+    "Đầy xe": "#7C3AED",
+    "Cân bằng": "#15803D",
+    "Ước tính": "#B45309",
+    "Dữ liệu cũ": "#B45309",
+    "Lỗi": "#B91C1C",
+    "Thông tin": "#0369A1",
+    "Chưa rõ": "#64748B",
+}
+CHART_COLORS = {
+    "pickups": "#0F766E",
+    "returns": "#7C3AED",
+    "net_flow": "#2563EB",
+}
 
 
 def _file_signature(path: Path | None) -> tuple[int, int]:
@@ -403,7 +418,13 @@ def render_data_status(status: dict[str, str], location: str) -> None:
             ],
             columns=["Thông tin", "Giá trị"],
         )
-        st.dataframe(details, hide_index=True, width="stretch")
+        st.dataframe(
+            _style_status_table(
+                details.rename(columns={"Giá trị": "Nguồn / trạng thái"})
+            ),
+            hide_index=True,
+            width="stretch",
+        )
 
 
 @st.cache_data(show_spinner=False, ttl=60)
@@ -420,7 +441,7 @@ def _cached_system_health(
 
 
 def render_system_health() -> None:
-    st.subheader("Use Case 14: System health & provenance")
+    st.subheader("Sức khỏe hệ thống & provenance")
     st.caption(
         "Kiểm tra đọc mẫu artifact processed/, khả năng nạp hai model và tính toàn vẹn/schema SQLite. "
         "Không quét toàn bộ dữ liệu; kết quả được cache 60 giây."
@@ -489,18 +510,19 @@ def render_system_health() -> None:
         st.success("Các thành phần được kiểm tra đang khả dụng.")
     checked_at = str(health["checked_at"].iloc[0])
     st.caption(f"Kiểm tra lúc: {checked_at} · UTC. Nhấn Làm mới để bỏ cache ngay.")
+    health_display = health.rename(
+        columns={
+            "component": "Thành phần",
+            "status": "Trạng thái",
+            "detail": "Chi tiết",
+            "checked_at": "Kiểm tra lúc (UTC)",
+            "updated_at": "Cập nhật gần nhất (UTC/DB)",
+            "estimated_flag": "Cờ ước tính / provenance",
+            "path": "Đường dẫn",
+        }
+    )
     st.dataframe(
-        health.rename(
-            columns={
-                "component": "Thành phần",
-                "status": "Trạng thái",
-                "detail": "Chi tiết",
-                "checked_at": "Kiểm tra lúc (UTC)",
-                "updated_at": "Cập nhật gần nhất (UTC/DB)",
-                "estimated_flag": "Cờ ước tính / provenance",
-                "path": "Đường dẫn",
-            }
-        ),
+        _style_status_table(health_display),
         hide_index=True,
         width="stretch",
     )
@@ -572,6 +594,7 @@ def _classify_station_status(
     return result
 
 
+@st.cache_data(show_spinner=False)
 def _station_snapshot(
     hourly: pd.DataFrame,
     stations: pd.DataFrame,
@@ -797,7 +820,80 @@ def _overlay_gbfs_snapshot(
 
 
 def _status_color(status: str) -> str:
-    return {"Thiếu xe": "#EF4444", "Đầy xe": "#A855F7", "Cân bằng": "#22C55E"}.get(status, "#94A3B8")
+    return STATUS_COLORS.get(status, STATUS_COLORS["Chưa rõ"])
+
+
+def _status_cell_style(value: object) -> str:
+    if value is None:
+        return ""
+    try:
+        missing = pd.isna(value)
+    except (TypeError, ValueError):
+        missing = False
+    if isinstance(missing, (bool, np.bool_)) and missing:
+        return ""
+    text = str(value).strip().casefold()
+    if text in {"true", "1", "yes", "estimated", "ước tính"} or any(
+        marker in text
+        for marker in (
+            "ước tính",
+            "estimated",
+            "fallback",
+            "quá hạn",
+            "dữ liệu cũ",
+            "stale",
+            "chưa đủ",
+            "chưa xác thực",
+        )
+    ):
+        color = STATUS_COLORS["Ước tính"]
+        background = "#FEF3C7"
+    elif "thiếu xe" in text or text == "error" or "lỗi" in text:
+        color = STATUS_COLORS["Lỗi"] if text in {"error", "lỗi"} or "lỗi" in text else STATUS_COLORS["Thiếu xe"]
+        background = "#FEE2E2"
+    elif "đầy xe" in text or "dư xe" in text:
+        color, background = STATUS_COLORS["Đầy xe"], "#EDE9FE"
+    elif "cân bằng" in text or text in {"ok", "approved", "gbfs thực tế"}:
+        color, background = STATUS_COLORS["Cân bằng"], "#DCFCE7"
+    elif text == "warning":
+        color, background = STATUS_COLORS["Ước tính"], "#FEF3C7"
+    elif text in {"info", "rejected"} or "chưa có" in text:
+        color, background = STATUS_COLORS["Thông tin"], "#E0F2FE"
+    elif "gbfs" in text or "station-hour" in text or "metadata" in text:
+        color, background = STATUS_COLORS["Thông tin"], "#E0F2FE"
+    elif text in {"false", "0", "no"}:
+        color, background = STATUS_COLORS["Cân bằng"], "#DCFCE7"
+    else:
+        return ""
+    return f"background-color: {background}; color: {color}; font-weight: 600;"
+
+
+def _style_status_table(frame: pd.DataFrame) -> pd.io.formats.style.Styler | pd.DataFrame:
+    status_columns = [
+        column
+        for column in frame.columns
+        if any(
+            marker in str(column).casefold()
+            for marker in (
+                "status",
+                "trạng thái",
+                "nguồn",
+                "source",
+                "ước tính",
+                "estimated",
+                "quality",
+                "chất lượng",
+                "fresh",
+            )
+        )
+    ]
+    if not status_columns:
+        return frame
+    return frame.style.apply(
+        lambda column: column.map(_status_cell_style),
+        subset=status_columns,
+        axis=0,
+    )
 
 
 def _map_timestamp(value: object) -> str:
@@ -899,19 +995,34 @@ def _build_folium_map(
         inventory_source = html.escape(str(row.get("inventory_source", "Không rõ nguồn")))
         capacity_source = html.escape(str(row.get("capacity_source", "Không rõ nguồn")))
         data_status = html.escape(str(row.get("data_status", "Thiếu dữ liệu")))
-        popup = (
-            f"<b>{station_name}</b><br>Mã trạm: {station_id}"
-            f"<br>Tồn kho: {bikes_text}/{capacity_text}"
-            f"<br>Pickups / Returns: {pickups_text} / {returns_text}"
-            f"<br>Trạng thái: {html.escape(status)}"
-            f"<br>Ngưỡng an toàn thấp / cao: {safe_min_text} / {safe_max_text} xe"
-            f"<br>Safety Buffer: {buffer_text}"
-            f"<br>Chất lượng dữ liệu: {data_status}"
-            f"<br>Nguồn tồn kho: {inventory_source}"
-            f"<br>Nguồn sức chứa: {capacity_source}"
-            f"<br>Cập nhật tồn kho: {_map_timestamp(row.get('inventory_updated_at'))}"
-            f"<br>Cập nhật sức chứa: {_map_timestamp(row.get('capacity_updated_at'))}"
-        )
+        popup = f"""
+        <div style="font:13px/1.5 Arial,sans-serif;min-width:220px;color:#172033">
+          <div style="display:flex;justify-content:space-between;gap:12px;align-items:center">
+            <strong style="font-size:15px">{station_name}</strong>
+            <span style="color:#fff;background:{color};padding:2px 8px;border-radius:999px">
+              {html.escape(status)}
+            </span>
+          </div>
+          <div style="color:#64748b;margin:2px 0 10px">Mã trạm {station_id}</div>
+          <div style="padding:8px 0;border-top:1px solid #e2e8f0">
+            <strong>Tồn kho</strong> {bikes_text} / {capacity_text} xe
+            <span style="color:#64748b"> · Pickups / Returns {pickups_text} / {returns_text}</span>
+          </div>
+          <div style="padding:8px 0;border-top:1px solid #e2e8f0">
+            <strong>Ngưỡng thiếu / dư</strong> {safe_min_text} / {safe_max_text} xe
+            <span style="color:#64748b"> · Safety Buffer {buffer_text}</span>
+          </div>
+          <div style="padding:8px 0;border-top:1px solid #e2e8f0">
+            <strong>Nguồn tồn kho:</strong> {inventory_source}<br>
+            <strong>Nguồn sức chứa:</strong> {capacity_source}<br>
+            <strong>Chất lượng:</strong> {data_status}
+          </div>
+          <div style="color:#64748b;padding-top:6px;border-top:1px solid #e2e8f0">
+            Cập nhật tồn kho {_map_timestamp(row.get('inventory_updated_at'))}<br>
+            Cập nhật sức chứa {_map_timestamp(row.get('capacity_updated_at'))}
+          </div>
+        </div>
+        """
         estimated = data_status != "GBFS thực tế"
         folium.CircleMarker(
             [row["lat"], row["lon"]],
@@ -953,7 +1064,7 @@ def _build_folium_map(
                         (from_location["lat"], from_location["lon"]),
                         (to_location["lat"], to_location["lon"]),
                     ],
-                    color="#F59E0B",
+                    color=STATUS_COLORS["Ước tính"],
                     weight=3,
                     opacity=0.8,
                     tooltip=f"{row.get('bikes', 0)} xe · {row.get('distance_km', 0)} km",
@@ -1001,7 +1112,7 @@ def render_map(
         orient="records", date_format="iso", default_handler=str
     )
     map_key = hashlib.sha256(
-        f"uc007-map-v3|{height}|{snapshot_records}|{plan_records}".encode("utf-8")
+        f"uc007-map-v4|{height}|{snapshot_records}|{plan_records}".encode("utf-8")
     ).hexdigest()
     cache = st.session_state.setdefault("uc007_map_cache", {})
     fmap = cache.get(map_key)
@@ -1011,6 +1122,15 @@ def render_map(
         while len(cache) > 4:
             cache.pop(next(iter(cache)))
 
+    st.markdown(
+        "<div class=\"status-legend\">"
+        f"<span><i style=\"background:{STATUS_COLORS['Thiếu xe']}\"></i>Thiếu xe</span>"
+        f"<span><i style=\"background:{STATUS_COLORS['Đầy xe']}\"></i>Đầy xe</span>"
+        f"<span><i style=\"background:{STATUS_COLORS['Cân bằng']}\"></i>Cân bằng</span>"
+        f"<span><i class=\"estimated-dot\"></i>Ước tính / fallback / dữ liệu cũ</span>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
     click_result = st_folium(
         fmap,
         height=height,
@@ -1440,7 +1560,7 @@ def load_decision_history(
 
 
 def render_decision_history() -> None:
-    st.subheader("Use Case 12: Lịch sử quyết định")
+    st.subheader("Lịch sử quyết định")
     try:
         history = load_decision_history(DB_PATH)
     except (OSError, sqlite3.Error, ValueError) as exc:
@@ -1461,7 +1581,7 @@ def render_decision_history() -> None:
             "uses_estimated_data": "Có dữ liệu ước tính",
         }
     )
-    st.dataframe(display, hide_index=True, width="stretch")
+    st.dataframe(_style_status_table(display), hide_index=True, width="stretch")
     st.caption(
         "Mã quyết định gắn với nội dung kế hoạch; thao tác lại trên cùng kế hoạch "
         "sẽ cập nhật trạng thái thay vì tạo bản ghi trùng."
@@ -2012,7 +2132,7 @@ def render_uc013_panel(
     projected: pd.DataFrame,
     snapshot_time: pd.Timestamp,
 ) -> None:
-    st.subheader("Use Case 13: Ưu đãi trả xe và đối chiếu thực thi")
+    st.subheader("Ưu đãi trả xe và đối chiếu thực thi")
     st.caption(
         "Đề xuất +15 điểm tại trạm thiếu xe theo dự báo t+1; thời hạn phát hành 60 phút. "
         "Chỉ phát hành khi mốc tồn kho/dự báo không quá 90 phút và provenance đầy đủ. "
@@ -2111,12 +2231,15 @@ def render_uc013_panel(
             )
         else:
             confirm_estimates = True
-        if st.button(
-            "Use Case 13: Phát hành khuyến nghị đủ điều kiện",
-            key="uc013_publish",
-            type="primary",
-            disabled=publishable.empty or (estimated_count > 0 and not confirm_estimates),
-        ):
+        publish_clicked = _confirm_action(
+            "uc013_publish",
+            "Chuẩn bị phát hành khuyến nghị",
+            f"Sẽ ghi tối đa {len(publishable):,} khuyến nghị đủ điều kiện vào SQLite; "
+            "các dòng đã phát hành cùng recommendation_id sẽ không bị nhân đôi.",
+            disabled=publishable.empty
+            or (estimated_count > 0 and not confirm_estimates),
+        )
+        if publish_clicked:
             try:
                 inserted = _persist_uc013_recommendations(publishable)
             except (OSError, sqlite3.Error, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -2136,12 +2259,19 @@ def render_uc013_panel(
         st.info(str(reason))
 
     template = pd.DataFrame(columns=_UC013_EXECUTION_CSV_COLUMNS)
+    template_csv = template.to_csv(index=False).encode("utf-8-sig")
+    template_download_confirmed = _confirm_download(
+        "uc013_template_download",
+        "Chỉ gồm tiêu đề cột bắt buộc và tùy chọn; không chứa sự kiện hay dữ liệu trạm.",
+        template_csv,
+    )
     st.download_button(
-        "Tải mẫu CSV thực thi/đối chiếu UC013",
-        template.to_csv(index=False).encode("utf-8-sig"),
+        "Tải mẫu CSV thực thi/đối chiếu",
+        template_csv,
         file_name="uc013_execution_template.csv",
         mime="text/csv",
         key="uc013_template_download",
+        disabled=not template_download_confirmed,
     )
     st.caption(
         "Cột bắt buộc: event_id, recommendation_id, station_id, status "
@@ -2172,12 +2302,22 @@ def render_uc013_panel(
             "is_estimated",
             "source_summary",
         ]
+        recommendations_csv = published_for_download[export_columns].to_csv(
+            index=False
+        ).encode("utf-8-sig")
+        recommendations_download_confirmed = _confirm_download(
+            "uc013_recommendations_download",
+            f"{len(published_for_download):,} khuyến nghị đã phát hành, gồm mã trạm, "
+            "điểm thưởng và cờ ước tính/nguồn.",
+            recommendations_csv,
+        )
         st.download_button(
             "Tải danh sách khuyến nghị đã phát hành",
-            published_for_download[export_columns].to_csv(index=False).encode("utf-8-sig"),
+            recommendations_csv,
             file_name="uc013_published_recommendations.csv",
             mime="text/csv",
             key="uc013_recommendations_download",
+            disabled=not recommendations_download_confirmed,
         )
 
     upload = st.file_uploader(
@@ -2185,10 +2325,16 @@ def render_uc013_panel(
         type=["csv"],
         key="uc013_execution_upload",
     )
-    if upload is not None and st.button(
-        "Use Case 13: Nhập và đối chiếu sự kiện",
-        key="uc013_import",
-    ):
+    if upload is not None:
+        import_clicked = _confirm_action(
+            "uc013_import",
+            "Chuẩn bị nhập và đối chiếu sự kiện",
+            f"Sẽ kiểm tra file {html.escape(upload.name)} và thêm/cập nhật các sự kiện "
+            "hợp lệ trong SQLite; ID trùng lệch định danh sẽ bị từ chối.",
+        )
+    else:
+        import_clicked = False
+    if upload is not None and import_clicked:
         try:
             prepared, report = _prepare_uc013_execution_import(
                 upload.getvalue(),
@@ -2676,7 +2822,58 @@ def _align_station_times(
     return parsed.dt.floor("h"), selected.floor("h")
 
 
+@st.cache_data(show_spinner=False, ttl=300)
+def _cached_build_forecast_table(
+    hourly: pd.DataFrame,
+    station_id: str,
+    selected_time: str,
+    data_source: str | None,
+    source_path: str,
+    source_mtime_ns: int,
+    source_size: int,
+    pickups_model_mtime_ns: int,
+    pickups_model_size: int,
+    returns_model_mtime_ns: int,
+    returns_model_size: int,
+) -> pd.DataFrame:
+    del (
+        source_path,
+        source_mtime_ns,
+        source_size,
+        pickups_model_mtime_ns,
+        pickups_model_size,
+        returns_model_mtime_ns,
+        returns_model_size,
+    )
+    return _build_forecast_table_uncached(
+        hourly,
+        station_id,
+        pd.Timestamp(selected_time),
+        data_source,
+    )
+
+
 def build_forecast_table(
+    hourly: pd.DataFrame,
+    station_id: str,
+    selected_time: pd.Timestamp,
+    data_source: str | None = None,
+) -> pd.DataFrame:
+    """Return a cached 24-hour series keyed by source and model file versions."""
+    source_path = _station_hour_source_path()
+    return _cached_build_forecast_table(
+        hourly,
+        str(station_id),
+        pd.Timestamp(selected_time).isoformat(),
+        data_source,
+        str(source_path) if source_path is not None else "",
+        *_file_signature(source_path),
+        *_file_signature(MODELS / "lgb_pickups.pkl"),
+        *_file_signature(MODELS / "lgb_returns.pkl"),
+    )
+
+
+def _build_forecast_table_uncached(
     hourly: pd.DataFrame,
     station_id: str,
     selected_time: pd.Timestamp,
@@ -3268,8 +3465,71 @@ def _load_backtesting_report(report_path: str | Path) -> pd.DataFrame:
 
 
 def metric_card(label: str, value: str, hint: str, color: str = "#8B5CF6") -> None:
-    st.markdown(f"""<div class="metric-card"><div class="metric-label">{label}</div>
-    <div class="metric-value" style="color:{color}">{value}</div><div class="metric-hint">{hint}</div></div>""", unsafe_allow_html=True)
+    allowed_colors = (
+        set(STATUS_COLORS.values())
+        | set(CHART_COLORS.values())
+        | {"#8B5CF6"}
+    )
+    safe_color = color if color in allowed_colors else STATUS_COLORS["Thông tin"]
+    st.markdown(
+        f"""<div class="metric-card" style="--metric-accent:{safe_color}">
+        <div class="metric-label">{html.escape(str(label))}</div>
+        <div class="metric-value" style="color:{safe_color}">{html.escape(str(value))}</div>
+        <div class="metric-hint" title="{html.escape(str(hint), quote=True)}">{html.escape(str(hint))}</div>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+
+def _confirm_action(
+    key: str,
+    action_label: str,
+    scope: str,
+    disabled: bool = False,
+) -> bool:
+    pending_key = f"{key}_pending"
+    if st.button(
+        action_label,
+        key=f"{key}_request",
+        width="stretch",
+        disabled=disabled,
+    ):
+        st.session_state[pending_key] = True
+    if disabled:
+        if st.session_state.pop(pending_key, None):
+            st.info("Đầu vào thay đổi hoặc không còn hợp lệ; xác nhận trước đó đã bị hủy.")
+        return False
+    if not st.session_state.get(pending_key, False):
+        return False
+
+    st.warning(scope)
+    confirm_column, cancel_column = st.columns(2)
+    with confirm_column:
+        confirmed = st.button(
+            "Xác nhận thao tác",
+            key=f"{key}_confirm",
+            type="primary",
+            disabled=disabled,
+        )
+    with cancel_column:
+        cancelled = st.button("Hủy", key=f"{key}_cancel")
+    if cancelled:
+        st.session_state.pop(pending_key, None)
+        st.info("Đã hủy; dữ liệu hiện có không bị thay đổi.")
+        return False
+    if confirmed:
+        st.session_state.pop(pending_key, None)
+        return True
+    return False
+
+
+def _confirm_download(key: str, scope: str, content: bytes) -> bool:
+    st.caption(f"Phạm vi tệp tải xuống: {scope}")
+    content_signature = hashlib.sha256(content).hexdigest()[:12]
+    return st.checkbox(
+        "Xác nhận tải tệp đã mô tả",
+        key=f"{key}_confirmed_{content_signature}",
+    )
 
 
 def clear_url_fragment() -> None:
@@ -3321,7 +3581,7 @@ def forecast_chart(
             x=historical["timestamp"],
             y=historical["pickups"],
             name="Pickups lịch sử",
-            line={"color": "#22C55E"},
+            line={"color": CHART_COLORS["pickups"]},
             connectgaps=False,
         )
     )
@@ -3330,7 +3590,7 @@ def forecast_chart(
             x=historical["timestamp"],
             y=historical["returns"],
             name="Returns lịch sử",
-            line={"color": "#A855F7"},
+            line={"color": CHART_COLORS["returns"]},
             connectgaps=False,
         )
     )
@@ -3339,7 +3599,7 @@ def forecast_chart(
             x=historical["timestamp"],
             y=historical["net_flow"],
             name="Net flow lịch sử",
-            line={"color": "#2563EB", "dash": "dash"},
+            line={"color": CHART_COLORS["net_flow"], "dash": "dash"},
             yaxis="y2",
             connectgaps=False,
         )
@@ -3350,7 +3610,7 @@ def forecast_chart(
             y=forecast["pickups_pred"],
             name="Pickups dự báo t+1",
             mode="markers",
-            marker={"color": "#86EFAC", "size": 11, "symbol": "diamond"},
+            marker={"color": "#5EEAD4", "size": 11, "symbol": "diamond"},
         )
     )
     figure.add_trace(
@@ -3359,7 +3619,7 @@ def forecast_chart(
             y=forecast["returns_pred"],
             name="Returns dự báo t+1",
             mode="markers",
-            marker={"color": "#D8B4FE", "size": 11, "symbol": "diamond"},
+            marker={"color": "#C4B5FD", "size": 11, "symbol": "diamond"},
         )
     )
     figure.add_trace(
@@ -3368,16 +3628,26 @@ def forecast_chart(
             y=forecast["net_flow_pred"],
             name="Net flow dự báo t+1",
             mode="markers",
-            marker={"color": "#60A5FA", "size": 11, "symbol": "diamond"},
+            marker={"color": "#93C5FD", "size": 11, "symbol": "diamond"},
             yaxis="y2",
         )
     )
+    if not forecast.empty:
+        forecast_timestamp = forecast["timestamp"].iloc[0]
+        figure.add_vline(
+            x=forecast_timestamp,
+            line={"color": "#94A3B8", "dash": "dot", "width": 1.5},
+            annotation_text="Dự báo t+1",
+            annotation_position="top",
+            annotation_font_color="#475569",
+        )
     figure.update_layout(
         template="plotly_white",
         height=470,
         margin={"l": 10, "r": 45, "t": 45, "b": 10},
         title="24 giờ lịch sử + dự báo cho đúng mốc t+1",
         hovermode="x unified",
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0},
         yaxis={"title": "Pickups / Returns"},
         yaxis2={"title": "Net flow", "overlaying": "y", "side": "right"},
     )
@@ -3687,23 +3957,408 @@ def _render_uc2_audit(stats: dict[str, object], preview: pd.DataFrame) -> None:
         st.dataframe(preview.head(5), hide_index=True, width="stretch")
 
 
+def _render_uc010_projection(
+    projected: pd.DataFrame,
+    snapshot_time: pd.Timestamp,
+    safety: float,
+) -> None:
+    st.subheader("Tồn kho dự kiến & vùng an toàn")
+    st.caption(
+        "Tồn cuối kỳ = tồn đầu kỳ − pickups dự báo + returns dự báo. "
+        "Kết quả sử dụng chung Safety Buffer với UC009."
+    )
+    if projected.empty:
+        st.info("Không có kết quả tồn kho dự kiến khả dụng.")
+        return
+
+    projectable = projected["data_quality"].eq("Đủ dữ liệu")
+    incomplete_count = int((~projectable).sum())
+    estimated_count = int(projected["projection_is_estimated"].sum())
+    st.caption(
+        f"Mốc tồn kho t: {snapshot_time:%d/%m/%Y %H:%M} · "
+        f"mốc dự báo t+1: {snapshot_time + pd.Timedelta(hours=1):%d/%m/%Y %H:%M} · "
+        f"Safety Buffer: {safety:.0%} · "
+        f"{int(projectable.sum()):,}/{len(projected):,} trạm đủ đầu vào."
+    )
+    if incomplete_count:
+        st.warning(
+            f"{incomplete_count:,} trạm thiếu hoặc có dữ liệu đầu vào không hợp lệ; "
+            "không được phân loại mất cân bằng hay đưa vào lịch điều phối."
+        )
+    if estimated_count:
+        st.info(
+            f"{estimated_count:,} trạm dùng tồn kho/sức chứa ước tính hoặc fallback. "
+            "Nguồn, cờ ước tính và thời điểm cập nhật được giữ trong bảng."
+        )
+
+    projection_columns = [
+        "station_id",
+        "station_name",
+        "bikes_available",
+        "forecast_pickups",
+        "forecast_returns",
+        "expected_stock",
+        "safe_min_bikes",
+        "safe_max_bikes",
+        "imbalance_status",
+        "data_quality",
+        "projection_is_estimated",
+        "inventory_is_estimated",
+        "capacity_is_estimated",
+        "projection_adjusted",
+        "inventory_source",
+        "capacity_source",
+        "capacity_updated_at",
+        "forecast_pickups_source",
+        "forecast_returns_source",
+        "inventory_updated_at",
+        "forecast_data_updated_at",
+        "forecast_updated_at",
+    ]
+    projection_labels = {
+        "station_id": "Mã trạm",
+        "station_name": "Trạm",
+        "bikes_available": "Tồn đầu kỳ",
+        "forecast_pickups": "Dự báo lấy",
+        "forecast_returns": "Dự báo trả",
+        "expected_stock": "Tồn cuối kỳ",
+        "safe_min_bikes": "Ngưỡng thiếu",
+        "safe_max_bikes": "Ngưỡng dư",
+        "imbalance_status": "Mất cân bằng",
+        "data_quality": "Chất lượng đầu vào",
+        "projection_is_estimated": "Có dữ liệu ước tính",
+        "inventory_is_estimated": "Tồn đầu kỳ ước tính",
+        "capacity_is_estimated": "Sức chứa ước tính",
+        "projection_adjusted": "Đã chặn theo biên",
+        "inventory_source": "Nguồn tồn đầu kỳ",
+        "capacity_source": "Nguồn sức chứa",
+        "capacity_updated_at": "Cập nhật sức chứa",
+        "forecast_pickups_source": "Nguồn dự báo lấy",
+        "forecast_returns_source": "Nguồn dự báo trả",
+        "inventory_updated_at": "Cập nhật tồn đầu kỳ",
+        "forecast_data_updated_at": "Cập nhật station-hour",
+        "forecast_updated_at": "Mốc dự báo",
+    }
+    projection_columns = [
+        column for column in projection_columns if column in projected.columns
+    ]
+    with st.expander("Bảng tồn kho dự kiến theo trạm", expanded=True):
+        projection_display = projected[projection_columns].rename(
+            columns=projection_labels
+        )
+        st.dataframe(
+            _style_status_table(projection_display),
+            hide_index=True,
+            width="stretch",
+            height=380,
+        )
+
+
+def _render_uc011_truck_schedule(
+    projected: pd.DataFrame,
+    plan: pd.DataFrame,
+    planning_base: pd.DataFrame,
+) -> None:
+    st.subheader("Lịch trình xe tải · Gom → Rải")
+    if projected.empty:
+        st.info("Chưa có tồn kho dự kiến hợp lệ để lập lịch.")
+        return
+
+    projectable = projected["data_quality"].eq("Đủ dữ liệu")
+    unbalanced_count = int(
+        projected["imbalance_status"].isin(["Thiếu xe", "Dư xe"]).sum()
+    )
+    unmatched = pd.DataFrame(plan.attrs.get("unmatched_stations", []))
+    unmatched_labels = {
+        "station_id": "Mã trạm",
+        "station_name": "Trạm",
+        "imbalance_status": "Trạng thái",
+        "remaining_surplus": "Xe dư chưa ghép",
+        "remaining_deficit": "Nhu cầu thiếu chưa ghép",
+        "reason": "Lý do",
+        "data_source": "Nguồn dữ liệu",
+        "updated_at": "Thời điểm cập nhật",
+        "uses_estimated_data": "Có dữ liệu ước tính",
+    }
+
+    route_bikes = pd.to_numeric(
+        plan.get("bikes", pd.Series(dtype="float64")),
+        errors="coerce",
+    ).replace([np.inf, -np.inf], np.nan).dropna()
+    route_distances = pd.to_numeric(
+        plan.get("distance_km", pd.Series(dtype="float64")),
+        errors="coerce",
+    ).replace([np.inf, -np.inf], np.nan).dropna()
+    unmatched_surplus = pd.to_numeric(
+        unmatched.get("remaining_surplus", pd.Series(dtype="float64")),
+        errors="coerce",
+    ).replace([np.inf, -np.inf], np.nan).fillna(0).sum()
+    unmatched_deficit = pd.to_numeric(
+        unmatched.get("remaining_deficit", pd.Series(dtype="float64")),
+        errors="coerce",
+    ).replace([np.inf, -np.inf], np.nan).fillna(0).sum()
+    scheduled_bikes = int(route_bikes.sum()) if not route_bikes.empty else 0
+    distance_km = float(route_distances.sum()) if not route_distances.empty else 0.0
+    estimated_route_count = int(
+        plan.get(
+            "uses_estimated_data",
+            pd.Series(False, index=plan.index),
+        )
+        .map(_decision_flag)
+        .sum()
+    )
+
+    metrics = st.columns(3)
+    with metrics[0]:
+        metric_card(
+            "Tổng xe điều phối",
+            f"{scheduled_bikes:,}",
+            f"{len(plan):,} chặng khả thi",
+            STATUS_COLORS["Cân bằng"],
+        )
+    with metrics[1]:
+        metric_card(
+            "Quãng đường",
+            f"{distance_km:.1f} km",
+            "Tổng quãng đường tuyến · Haversine",
+            STATUS_COLORS["Thông tin"],
+        )
+    with metrics[2]:
+        metric_card(
+            "Xe dư / thiếu chưa ghép",
+            f"{int(unmatched_surplus):,} / {int(unmatched_deficit):,}",
+            f"{len(unmatched):,} trạm cần xử lý",
+            STATUS_COLORS["Thiếu xe"],
+        )
+
+    if not projectable.any():
+        st.warning(
+            "Chưa đủ dự báo, tồn kho đầu kỳ hoặc sức chứa hợp lệ để lập lịch điều phối."
+        )
+    elif plan.empty and unbalanced_count:
+        st.warning(
+            f"Có {unbalanced_count:,} trạm mất cân bằng nhưng chưa tạo được tuyến khả thi."
+        )
+    elif plan.empty:
+        st.success("Các trạm đủ dữ liệu hiện nằm trong vùng an toàn.")
+
+    if estimated_route_count:
+        st.warning(
+            f"{estimated_route_count:,}/{len(plan):,} tuyến có ít nhất một đầu vào "
+            "ước tính/fallback; kiểm tra nguồn và thời điểm trước khi điều phối."
+        )
+    if not unmatched.empty:
+        st.warning(
+            f"Còn {len(unmatched):,} trạm chưa ghép hết; lượng dư/thiếu không nằm "
+            "trong tổng xe đã lập lịch."
+        )
+        st.dataframe(
+            _style_status_table(unmatched.rename(columns=unmatched_labels)),
+            hide_index=True,
+            width="stretch",
+        )
+    if not plan.empty:
+        plan_labels = {
+            "route_id": "Mã tuyến",
+            "route": "Tuyến",
+            "from_station": "Trạm nguồn",
+            "from_station_id": "Mã trạm nguồn",
+            "to_station": "Trạm đích",
+            "to_station_id": "Mã trạm đích",
+            "bikes": "Số xe",
+            "distance_km": "Khoảng cách (km)",
+            "priority": "Ưu tiên",
+            "from_data_source": "Nguồn dữ liệu trạm nguồn",
+            "to_data_source": "Nguồn dữ liệu trạm đích",
+            "from_updated_at": "Cập nhật trạm nguồn",
+            "to_updated_at": "Cập nhật trạm đích",
+            "uses_estimated_data": "Có dữ liệu ước tính",
+        }
+        st.dataframe(
+            _style_status_table(plan.rename(columns=plan_labels)),
+            hide_index=True,
+            width="stretch",
+        )
+    if not planning_base.empty:
+        render_map(planning_base, plan)
+
+
+def _render_uc012_approval(plan: pd.DataFrame, snapshot_time: pd.Timestamp, safety: float) -> None:
+    st.subheader("Phê duyệt & lịch sử lệnh")
+    route_count = len(plan)
+    route_bikes = pd.to_numeric(
+        plan.get("bikes", pd.Series(dtype="float64")),
+        errors="coerce",
+    ).replace([np.inf, -np.inf], np.nan).dropna()
+    distance = pd.to_numeric(
+        plan.get("distance_km", pd.Series(dtype="float64")),
+        errors="coerce",
+    ).replace([np.inf, -np.inf], np.nan).dropna()
+    scheduled_bikes = int(route_bikes.sum()) if not route_bikes.empty else 0
+    distance_km = float(distance.sum()) if not distance.empty else 0.0
+    estimated_route_count = int(
+        plan.get(
+            "uses_estimated_data",
+            pd.Series(False, index=plan.index),
+        )
+        .map(_decision_flag)
+        .sum()
+    )
+    current_summary = st.columns(3)
+    with current_summary[0]:
+        metric_card("Chặng hiện tại", f"{route_count:,}", "Kế hoạch UC011")
+    with current_summary[1]:
+        metric_card(
+            "Số xe",
+            f"{scheduled_bikes:,}",
+            f"Quãng đường {distance_km:.1f} km",
+        )
+    with current_summary[2]:
+        metric_card(
+            "Tuyến có ước tính",
+            f"{estimated_route_count:,}/{route_count:,}",
+            "Kiểm tra provenance trước khi quyết định",
+            STATUS_COLORS["Ước tính"],
+        )
+    st.caption(
+        f"Mốc vận hành {snapshot_time:%d/%m/%Y %H:%M} · Safety Buffer {safety:.0%} · "
+        "quyết định được gắn với nội dung kế hoạch hiện tại."
+    )
+    if plan.empty:
+        st.info("Chưa có tuyến khả thi để phê duyệt hoặc từ chối.")
+    else:
+        plan_signature = hashlib.sha256(
+            plan.to_json(
+                orient="records",
+                date_format="iso",
+                default_handler=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        pending_decision_key = "uc012_pending_decision"
+        approve_column, reject_column = st.columns(2)
+        with approve_column:
+            request_approve = st.button(
+                "Phê duyệt lệnh",
+                type="primary",
+                key="uc012_request_approve",
+                width="stretch",
+            )
+        with reject_column:
+            request_reject = st.button(
+                "Từ chối lệnh",
+                key="uc012_request_reject",
+                width="stretch",
+            )
+        if request_approve:
+            st.session_state[pending_decision_key] = {
+                "action": "APPROVED",
+                "plan_signature": plan_signature,
+            }
+        elif request_reject:
+            st.session_state[pending_decision_key] = {
+                "action": "REJECTED",
+                "plan_signature": plan_signature,
+            }
+
+        pending_decision = st.session_state.get(pending_decision_key)
+        if isinstance(pending_decision, dict):
+            pending_action = str(pending_decision.get("action", ""))
+            if pending_decision.get("plan_signature") != plan_signature:
+                st.session_state.pop(pending_decision_key, None)
+                st.warning(
+                    "Kế hoạch đã thay đổi theo tham số hoặc dữ liệu mới; "
+                    "yêu cầu xác nhận cũ đã bị hủy."
+                )
+            elif pending_action not in {"APPROVED", "REJECTED"}:
+                st.session_state.pop(pending_decision_key, None)
+                st.error("Trạng thái xác nhận UC012 không hợp lệ; đã hủy thao tác.")
+            else:
+                action_label = "phê duyệt" if pending_action == "APPROVED" else "từ chối"
+                st.warning(
+                    f"Xác nhận {action_label} {route_count:,} chặng, {scheduled_bikes:,} xe "
+                    f"tại {snapshot_time:%d/%m/%Y %H:%M}, Safety Buffer {safety:.0%}. "
+                    "Quyết định sẽ được ghi vào nhật ký UC012."
+                )
+                confirm_column, cancel_column = st.columns(2)
+                with confirm_column:
+                    confirm_decision = st.button(
+                        f"Xác nhận {action_label}",
+                        type="primary",
+                        key="uc012_confirm_decision",
+                    )
+                with cancel_column:
+                    cancel_decision = st.button(
+                        "Hủy",
+                        key="uc012_cancel_decision",
+                    )
+                if cancel_decision:
+                    st.session_state.pop(pending_decision_key, None)
+                    st.info("Đã hủy; nhật ký quyết định không thay đổi.")
+                elif confirm_decision:
+                    try:
+                        decision_id = log_decision(pending_action, plan)
+                    except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+                        st.error(f"Không thể ghi quyết định UC012: {exc}")
+                    else:
+                        st.session_state.pop(pending_decision_key, None)
+                        message = (
+                            "Đã ghi nhận/cập nhật quyết định "
+                            f"(mã `{decision_id[:12]}`)."
+                        )
+                        if pending_action == "APPROVED":
+                            st.success(message)
+                        else:
+                            st.info(message)
+    render_decision_history()
+
+
 def main() -> None:
     st.set_page_config(page_title="BikeMind DSS", page_icon="🚲", layout="wide", initial_sidebar_state="expanded")
     clear_url_fragment()
-    st.markdown("""<style>
-    @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap');
-    html, body, [class*="css"] { font-family: 'Plus Jakarta Sans', sans-serif; }
-    .stApp { background: #FFFFFF; color: #172033; } .block-container { padding-top: 1.4rem; }
-    [data-testid="stSidebar"] { background: #F6F7FB; border-right: 1px solid #E1E5EF; }
-    .metric-card { background:#FFFFFF; border:1px solid #E1E5EF; border-radius:14px; padding:18px; min-height:110px; box-shadow:0 2px 8px rgba(23,32,51,.05); }
-    .metric-label,.metric-hint { color:#667085; font-size:.78rem; } .metric-value { font-size:1.75rem; font-weight:800; margin:5px 0; }
-    .section-card { background:#FFFFFF; border:1px solid #E1E5EF; border-radius:14px; padding:18px; box-shadow:0 2px 8px rgba(23,32,51,.05); }
-    .data-status-title { color:#172033; font-size:1.15rem; font-weight:700; margin:0 0 .6rem; }
-    h1,h2,h3 { color:#172033; letter-spacing:-.02em; } .stButton button { border-radius:9px; font-weight:700; }
-    [data-testid="stDataFrame"] { border:1px solid #E1E5EF; border-radius:10px; }
-    [data-testid="stHeaderActionElements"] { display:none !important; }
-    [data-testid="stHeaderActionElements"] button { display:none !important; }
-    </style>""", unsafe_allow_html=True)
+    st.markdown(
+        """<style>
+        @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
+        :root {
+          --bm-ink:#172033; --bm-muted:#64748B; --bm-border:#E2E8F0;
+          --bm-canvas:#F4F7FB; --bm-card:#FFFFFF; --bm-brand:#164E63;
+          --bm-estimated:#B45309; --bm-shortage:#DC2626; --bm-full:#7C3AED;
+          --bm-balanced:#15803D; --bm-info:#0369A1;
+        }
+        html, body, [class*="css"] { font-family:'Plus Jakarta Sans',sans-serif; }
+        .stApp { background:var(--bm-canvas); color:var(--bm-ink); }
+        .block-container { max-width:1680px; padding-top:1.3rem; padding-bottom:2rem; }
+        [data-testid="stSidebar"] { background:#F8FAFC; border-right:1px solid var(--bm-border); }
+        [data-testid="stSidebar"] h2 { color:var(--bm-brand); letter-spacing:-.04em; }
+        .page-kicker { color:var(--bm-info); font-size:.72rem; font-weight:800; letter-spacing:.12em; margin-bottom:-.6rem; }
+        h1,h2,h3 { color:var(--bm-ink); letter-spacing:-.035em; }
+        h1 { font-size:clamp(1.7rem,2.5vw,2.3rem); }
+        .metric-card { background:var(--bm-card); border:1px solid var(--bm-border); border-left:4px solid var(--metric-accent,#164E63); border-radius:14px; padding:13px 15px; min-height:96px; box-shadow:0 5px 18px rgba(23,32,51,.045); }
+        .metric-label,.metric-hint { color:var(--bm-muted); font-size:.76rem; line-height:1.35; }
+        .metric-label { font-weight:700; }
+        .metric-value { font-size:1.7rem; font-weight:800; line-height:1.2; margin:5px 0 2px; }
+        .metric-hint { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+        [data-testid="stMetric"] { background:var(--bm-card); border:1px solid var(--bm-border); border-radius:12px; padding:11px 13px; }
+        [data-testid="stMetricLabel"] { color:var(--bm-muted); font-weight:600; }
+        .stButton button,.stDownloadButton button { border-radius:10px; font-weight:700; min-height:2.55rem; }
+        [data-testid="stDataFrame"] { border:1px solid var(--bm-border); border-radius:12px; overflow:hidden; }
+        [data-testid="stTabs"] button { font-weight:700; }
+        [data-testid="stAlert"],[data-testid="stExpander"] { border-radius:12px; }
+        .status-legend { display:flex; flex-wrap:wrap; gap:8px 16px; align-items:center; padding:0 0 10px; color:var(--bm-muted); font-size:.76rem; }
+        .status-legend span { display:inline-flex; align-items:center; gap:6px; }
+        .status-legend i { width:10px; height:10px; border-radius:50%; display:inline-block; }
+        .status-legend .estimated-dot { background:var(--bm-estimated); outline:2px dashed #FCD34D; outline-offset:2px; }
+        .context-strip { display:flex; flex-wrap:wrap; gap:7px; margin:.25rem 0 .8rem; }
+        .context-chip { border:1px solid var(--bm-border); background:#fff; color:#475569; border-radius:999px; padding:5px 10px; font-size:.75rem; }
+        [data-testid="stHeaderActionElements"] { display:none !important; }
+        [data-testid="stHeaderActionElements"] button { display:none !important; }
+        @media (max-width:760px) {
+          .block-container { padding-left:1rem; padding-right:1rem; }
+          .metric-card { min-height:88px; padding:11px; }
+          .metric-value { font-size:1.45rem; }
+        }
+        </style>""",
+        unsafe_allow_html=True,
+    )
     hourly, stations, data_source = load_dashboard_data()
     try:
         gbfs_status, gbfs_freshness = _load_latest_station_status(DB_PATH)
@@ -3737,8 +4392,16 @@ def main() -> None:
         st.caption("Smart Mobility · DSS for Public Bicycle Rebalancing")
         selected_date = st.date_input("Ngày vận hành", value=latest.date())
         selected_hour = st.slider("Giờ quan sát", 0, 23, latest.hour)
-        st.selectbox("Loại ngày", ["Tất cả", "Ngày thường", "Cuối tuần"])
-        st.selectbox("Thời tiết", ["Tự động", "Nắng", "Mưa", "Nhiều mây"])
+        day_type = st.selectbox(
+            "Loại ngày",
+            ["Tất cả", "Ngày thường", "Cuối tuần"],
+            help="Ngữ cảnh hiển thị; không tự lọc hoặc hiệu chỉnh mô hình nếu nguồn không có nhãn này.",
+        )
+        weather_context = st.selectbox(
+            "Thời tiết",
+            ["Tự động", "Nắng", "Mưa", "Nhiều mây"],
+            help="Ngữ cảnh vận hành; dự báo không được hiệu chỉnh thủ công theo lựa chọn này.",
+        )
         safety = st.slider("Safety Buffer (%)", 0, 50, 15) / 100
         snapshot_time = pd.Timestamp(selected_date) + pd.Timedelta(hours=selected_hour)
         if data_source.startswith("Demo"):
@@ -3767,131 +4430,239 @@ def main() -> None:
             )
         else:
             st.caption("Tồn kho trên bản đồ đang dùng dữ liệu ước tính station-hour.")
-        st.metric("🔴 Thiếu xe", int((snapshot.status == "Thiếu xe").sum()))
-        st.metric("🟣 Đầy xe", int((snapshot.status == "Đầy xe").sum()))
-        st.metric("🟢 Cân bằng", int((snapshot.status == "Cân bằng").sum()))
+        metric_card(
+            "Thiếu xe",
+            f"{int((snapshot.status == 'Thiếu xe').sum()):,}",
+            "Dưới ngưỡng an toàn",
+            STATUS_COLORS["Thiếu xe"],
+        )
+        metric_card(
+            "Đầy xe",
+            f"{int((snapshot.status == 'Đầy xe').sum()):,}",
+            "Trên ngưỡng an toàn",
+            STATUS_COLORS["Đầy xe"],
+        )
+        metric_card(
+            "Cân bằng",
+            f"{int((snapshot.status == 'Cân bằng').sum()):,}",
+            "Trong vùng an toàn",
+            STATUS_COLORS["Cân bằng"],
+        )
+    st.markdown('<div class="page-kicker">BIKEMIND · SMART MOBILITY DSS</div>', unsafe_allow_html=True)
     st.title("BikeMind Operations Center")
     st.caption(
-        f"Live decision support · Dữ liệu station-hour đến {latest:%d/%m/%Y %H:%M} · "
-        f"Safety buffer {safety:.0%}"
+        "Vận hành trạm · Phân tích xu hướng · Điều phối dựa trên dữ liệu"
     )
-    if gbfs_freshness.get("optional_missing_count"):
-        st.caption(
-            f"GBFS có {int(gbfs_freshness['optional_missing_count']):,} bản ghi thiếu trường tùy chọn; "
-            "sức chứa thiếu từ station_information sẽ dùng giá trị station_metadata (có thể là ước tính)."
-        )
-    if live_station_count and estimated_station_count:
-        st.warning(
-            f"Nguồn tồn kho hỗn hợp: {live_station_count:,} trạm dùng GBFS đã xác thực "
-            f"(thu thập {gbfs_freshness.get('collected_at', 'không rõ thời điểm')}); "
-            f"{estimated_station_count:,} trạm còn lại dùng ước tính station-hour. "
-            "Xem cột Nguồn tồn kho trên bản đồ trước khi điều phối."
-        )
-    elif live_station_count:
-        st.success(
-            f"Nguồn tồn kho: GBFS thời gian thực đã xác thực · "
-            f"{live_station_count:,} trạm · thu thập "
-            f"{gbfs_freshness.get('collected_at', 'không rõ thời điểm')}."
-        )
-    elif snapshot.empty:
-        st.warning(
-            "Không có metadata tọa độ trạm để hiển thị hoặc đối chiếu GBFS; "
-            "bản đồ chưa có tồn kho khả dụng."
-        )
-    elif gbfs_freshness.get("fresh_count", 0):
-        st.warning(
-            f"GBFS có {int(gbfs_freshness['fresh_count']):,} bản ghi mới và đã xác thực "
-            "nhưng không khớp station_id trong metadata bản đồ. "
-            "Bản đồ đang dùng tồn kho ước tính từ station-hour."
-        )
-    elif gbfs_freshness.get("state") == "stale":
-        st.warning(
-            f"{gbfs_freshness.get('message')} Bản đồ đang dùng tồn kho ước tính "
-            "từ station-hour; không dùng snapshot cũ để tính điều phối."
-        )
-    else:
-        st.warning(
-            f"{gbfs_freshness.get('message', 'Chưa có snapshot GBFS hợp lệ.')} "
-            "Bản đồ đang dùng tồn kho ước tính từ station-hour."
-        )
+    inventory_summary = (
+        f"GBFS thực tế: {live_station_count:,} trạm · Ước tính/fallback: {estimated_station_count:,} trạm"
+        if live_station_count
+        else "Tồn kho ước tính từ station-hour · chưa có GBFS hợp lệ"
+    )
+    st.markdown(
+        '<div class="context-strip">'
+        f'<span class="context-chip">Ngày vận hành · {selected_date:%d/%m/%Y}</span>'
+        f'<span class="context-chip">Giờ quan sát t · {selected_hour:02d}:00</span>'
+        f'<span class="context-chip">Safety Buffer · {safety:.0%}</span>'
+        f'<span class="context-chip">Loại ngày · {html.escape(day_type)}</span>'
+        f'<span class="context-chip">Thời tiết · {html.escape(weather_context)}</span>'
+        f'<span class="context-chip">Nguồn · {html.escape(data_source)}</span>'
+        f'<span class="context-chip">{html.escape(inventory_summary)}</span>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        f"Dữ liệu station-hour đến {latest:%d/%m/%Y %H:%M} · "
+        "Múi giờ hiển thị theo timestamp của nguồn. Loại ngày và thời tiết là ngữ cảnh, "
+        "không tự thay đổi dự báo."
+    )
+    with st.expander(
+        "Nguồn dữ liệu & cảnh báo chất lượng",
+        expanded=False,
+    ):
+        if gbfs_freshness.get("optional_missing_count"):
+            st.info(
+                f"GBFS có {int(gbfs_freshness['optional_missing_count']):,} bản ghi thiếu trường tùy chọn; "
+                "sức chứa thiếu từ station_information có thể dùng station_metadata ước tính."
+            )
+        if live_station_count and estimated_station_count:
+            st.warning(
+                f"Nguồn tồn kho hỗn hợp: {live_station_count:,} trạm GBFS đã xác thực "
+                f"(thu thập {gbfs_freshness.get('collected_at', 'không rõ thời điểm')}); "
+                f"{estimated_station_count:,} trạm dùng ước tính station-hour."
+            )
+        elif live_station_count:
+            st.success(
+                f"GBFS thời gian thực đã xác thực · {live_station_count:,} trạm · "
+                f"thu thập {gbfs_freshness.get('collected_at', 'không rõ thời điểm')}."
+            )
+        elif snapshot.empty:
+            st.warning("Thiếu metadata tọa độ hoặc tồn kho; bản đồ chưa có trạm khả dụng.")
+        elif gbfs_freshness.get("fresh_count", 0):
+            st.warning(
+                f"GBFS có {int(gbfs_freshness['fresh_count']):,} bản ghi mới nhưng không khớp station_id; "
+                "bản đồ đang dùng tồn kho ước tính."
+            )
+        else:
+            st.warning(
+                f"{gbfs_freshness.get('message', 'Chưa có snapshot GBFS hợp lệ.')} "
+                "Không dùng snapshot cũ để tính điều phối; bản đồ dùng dữ liệu ước tính."
+            )
     tabs = st.tabs([
-        "Use Case 07/09: 📍 Vận hành Real-time",
-        "Use Case 08: 📊 Phân tích Dự báo",
-        "Use Case 10-13: 🚛 Đề xuất & Tái phân bổ",
-        "Use Case 01-06: ⚙️ Quản trị Backend & AI",
-        "Use Case 14/15: 📈 Mô phỏng & Backtesting",
+        "📍 Vận hành",
+        "📈 Dự báo",
+        "🚚 Điều phối",
+        "⚙️ Pipeline & AI",
+        "🧪 Hệ thống & mô phỏng",
     ])
     with tabs[0]:
-        if estimated_station_count and snapshot_time.date() != pd.Timestamp.now().date():
-            st.info(
-                f"Các chỉ số tại mốc lịch sử {snapshot_time:%d/%m/%Y %H:%M} "
-                f"dùng {estimated_station_count:,} trạm fallback/ước tính từ station-hour; "
-                "đây không phải tồn kho thực tế của mốc lịch sử đó."
-            )
-        c1, c2, c3, c4 = st.columns(4)
-        with c1: metric_card("Tổng trạm", f"{len(snapshot)}", "Mạng lưới đang giám sát")
-        source_hint = (
-            f"{live_station_count:,} trạm GBFS · {estimated_station_count:,} trạm ước tính"
-            if live_station_count and estimated_station_count
-            else ("Nguồn GBFS thời gian thực" if live_station_count else "Nguồn ước tính từ station-hour")
+        operational_tabs = st.tabs([
+            "Bản đồ & trạm cần chú ý",
+            "Chi tiết trạm & ngưỡng buffer",
+        ])
+        station_options = (
+            snapshot["station_id"].dropna().astype(str).drop_duplicates().tolist()
+            if "station_id" in snapshot
+            else []
         )
-        with c2: metric_card("Xe khả dụng", f"{snapshot.bikes_available.sum():,.0f}", source_hint, "#22C55E")
-        balance_rate = 0 if snapshot.empty else (snapshot.status == "Cân bằng").mean()
-        with c3: metric_card("Tỷ lệ cân bằng", f"{balance_rate:.0%}", "Mục tiêu > 70%", "#38BDF8")
-        with c4: metric_card("Cảnh báo", f"{(snapshot.status != 'Cân bằng').sum()}", "Cần hành động", "#F59E0B")
-        left, right = st.columns([2.1, 1])
-        with left:
-            clicked_station_id = render_map(snapshot)
-        with right:
-            st.subheader("Use Case 07: Stations cần chú ý")
-            attention = snapshot[snapshot.status != "Cân bằng"].sort_values("utilization")
-            detail_columns = [
-                "station_name",
-                "bikes_available",
-                "capacity",
-                "safe_min_bikes",
-                "safe_max_bikes",
-                "safety_buffer_pct",
-                "status",
-                "inventory_source",
-            ]
-            detail_columns = [
-                column for column in detail_columns if column in attention.columns
-            ]
-            st.dataframe(attention[detail_columns].rename(
-                columns={
-                    "station_name": "Trạm",
-                    "bikes_available": "Xe",
-                    "capacity": "Sức chứa",
-                    "safe_min_bikes": "Ngưỡng thấp",
-                    "safe_max_bikes": "Ngưỡng cao",
-                    "safety_buffer_pct": "Safety Buffer (%)",
-                    "status": "Trạng thái",
-                    "inventory_source": "Nguồn tồn kho",
-                }),
-                hide_index=True, width="stretch")
-            st.markdown("#### Chi tiết trạm")
-            station_options = (
-                snapshot["station_id"].dropna().astype(str).drop_duplicates().tolist()
-                if "station_id" in snapshot
-                else []
+        station_names = (
+            snapshot.assign(_station_id=snapshot["station_id"].astype(str))
+            .drop_duplicates("_station_id")
+            .set_index("_station_id")["station_name"]
+            .astype(str)
+            .to_dict()
+            if "station_name" in snapshot
+            else {}
+        )
+        clicked_station_id: str | None = None
+        with operational_tabs[0]:
+            if estimated_station_count and snapshot_time.date() != pd.Timestamp.now().date():
+                st.info(
+                    f"Mốc lịch sử {snapshot_time:%d/%m/%Y %H:%M}: "
+                    f"{estimated_station_count:,} trạm dùng fallback/ước tính station-hour, "
+                    "không phải tồn kho thực tế của thời điểm đó."
+                )
+            metrics = st.columns(4)
+            with metrics[0]:
+                metric_card("Tổng trạm", f"{len(snapshot):,}", "Mạng lưới đang giám sát")
+            source_hint = (
+                f"{live_station_count:,} GBFS · {estimated_station_count:,} ước tính"
+                if live_station_count and estimated_station_count
+                else (
+                    "GBFS thời gian thực"
+                    if live_station_count
+                    else "Ước tính từ station-hour"
+                )
             )
-            if station_options:
+            with metrics[1]:
+                metric_card(
+                    "Xe khả dụng",
+                    f"{snapshot['bikes_available'].sum():,.0f}",
+                    source_hint,
+                    STATUS_COLORS["Cân bằng"],
+                )
+            balance_rate = (
+                0.0
+                if snapshot.empty
+                else float(snapshot["status"].eq("Cân bằng").mean())
+            )
+            with metrics[2]:
+                metric_card(
+                    "Tỷ lệ cân bằng",
+                    f"{balance_rate:.0%}",
+                    "Theo vùng Safety Buffer",
+                    STATUS_COLORS["Cân bằng"],
+                )
+            with metrics[3]:
+                metric_card(
+                    "Cảnh báo",
+                    f"{int(snapshot['status'].ne('Cân bằng').sum()):,}",
+                    "Cần theo dõi / điều phối",
+                    STATUS_COLORS["Ước tính"],
+                )
+
+            left, right = st.columns([2.1, 1])
+            with left:
+                clicked_station_id = render_map(snapshot)
+            with right:
+                st.subheader("Stations cần chú ý")
+                attention = snapshot.loc[
+                    snapshot["status"].ne("Cân bằng")
+                ].sort_values("utilization")
+                attention_search = st.text_input(
+                    "Lọc theo tên hoặc mã trạm",
+                    placeholder="Nhập tên/mã trạm",
+                    key="uc007_attention_filter",
+                ).strip()
+                if attention_search:
+                    searchable = attention.astype(str).apply(
+                        lambda column: column.str.contains(
+                            attention_search,
+                            case=False,
+                            regex=False,
+                            na=False,
+                        )
+                    )
+                    attention = attention.loc[searchable.any(axis=1)]
+                detail_columns = [
+                    "station_id",
+                    "station_name",
+                    "bikes_available",
+                    "capacity",
+                    "safe_min_bikes",
+                    "safe_max_bikes",
+                    "safety_buffer_pct",
+                    "status",
+                    "inventory_source",
+                ]
+                detail_columns = [
+                    column for column in detail_columns if column in attention.columns
+                ]
+                total_attention = int(snapshot["status"].ne("Cân bằng").sum())
+                st.caption(
+                    f"Đang hiển thị {len(attention):,}/{total_attention:,} trạm cần chú ý."
+                )
+                if attention.empty:
+                    st.info(
+                        "Không có trạm khớp bộ lọc; KPI phía trên tính trên toàn mạng."
+                    )
+                else:
+                    attention_display = attention[detail_columns].rename(
+                        columns={
+                            "station_id": "Mã trạm",
+                            "station_name": "Trạm",
+                            "bikes_available": "Xe",
+                            "capacity": "Sức chứa",
+                            "safe_min_bikes": "Ngưỡng thiếu",
+                            "safe_max_bikes": "Ngưỡng dư",
+                            "safety_buffer_pct": "Safety Buffer (%)",
+                            "status": "Trạng thái",
+                            "inventory_source": "Nguồn tồn kho",
+                        }
+                    )
+                    st.dataframe(
+                        _style_status_table(attention_display),
+                        hide_index=True,
+                        width="stretch",
+                    )
+
+        with operational_tabs[1]:
+            st.subheader("Chi tiết trạm & vùng ngưỡng an toàn")
+            st.caption(
+                f"Safety Buffer hiện hành: {safety:.0%} · "
+                "Ngưỡng thiếu/dư dùng cùng cấu hình với UC010."
+            )
+            if not station_options:
+                st.info("Chưa có trạm để xem chi tiết.")
+            else:
                 if clicked_station_id in station_options:
                     st.session_state["uc007_detail_station"] = clicked_station_id
-                if st.session_state.get("uc007_detail_station") not in station_options:
+                if (
+                    st.session_state.get("uc007_detail_station")
+                    not in station_options
+                ):
                     st.session_state["uc007_detail_station"] = station_options[0]
-                station_names = (
-                    snapshot.assign(_station_id=snapshot["station_id"].astype(str))
-                    .drop_duplicates("_station_id")
-                    .set_index("_station_id")["station_name"]
-                    .astype(str)
-                    .to_dict()
-                    if "station_name" in snapshot
-                    else {}
-                )
                 chosen_station_id = st.selectbox(
-                    "Chọn trạm trên bản đồ hoặc danh sách",
+                    "Chọn trạm",
                     station_options,
                     format_func=lambda value: (
                         f"{station_names.get(value, 'Trạm')} · {value}"
@@ -3901,49 +4672,133 @@ def main() -> None:
                 chosen_rows = snapshot.loc[
                     snapshot["station_id"].astype(str).eq(chosen_station_id)
                 ]
-                if not chosen_rows.empty:
+                if chosen_rows.empty:
+                    st.info("Không có dữ liệu chi tiết cho trạm đã chọn.")
+                else:
                     chosen = chosen_rows.iloc[0]
-                    st.write(
-                        f"**{chosen.get('station_name', 'Không rõ tên')}** · "
-                        f"Mã trạm `{chosen_station_id}` · "
-                        f"Trạng thái **{chosen.get('status', 'Thiếu dữ liệu')}**"
-                    )
                     bikes_value = pd.to_numeric(
                         chosen.get("bikes_available"), errors="coerce"
                     )
                     capacity_value = pd.to_numeric(
                         chosen.get("capacity"), errors="coerce"
                     )
-                    bikes_display = (
-                        "Thiếu dữ liệu"
-                        if pd.isna(bikes_value)
-                        else f"{bikes_value:.0f}"
+                    safe_min_value = pd.to_numeric(
+                        chosen.get("safe_min_bikes"), errors="coerce"
                     )
-                    capacity_display = (
-                        "Thiếu dữ liệu"
-                        if pd.isna(capacity_value)
-                        else f"{capacity_value:.0f}"
+                    safe_max_value = pd.to_numeric(
+                        chosen.get("safe_max_bikes"), errors="coerce"
+                    )
+                    finite_capacity = (
+                        math.isfinite(float(capacity_value))
+                        and float(capacity_value) > 0
+                        if pd.notna(capacity_value)
+                        else False
+                    )
+                    detail_metrics = st.columns(3)
+                    with detail_metrics[0]:
+                        inventory_display = (
+                            "—"
+                            if pd.isna(bikes_value) or pd.isna(capacity_value)
+                            else f"{bikes_value:.0f}/{capacity_value:.0f}"
+                        )
+                        metric_card(
+                            "Tồn kho / sức chứa",
+                            inventory_display,
+                            str(chosen.get("inventory_source", "Nguồn chưa rõ")),
+                            _status_color(str(chosen.get("status", ""))),
+                        )
+                    with detail_metrics[1]:
+                        metric_card(
+                            "Ngưỡng thiếu",
+                            "—" if pd.isna(safe_min_value) else f"{safe_min_value:.1f} xe",
+                            f"Safety Buffer {safety:.0%}",
+                            STATUS_COLORS["Thiếu xe"],
+                        )
+                    with detail_metrics[2]:
+                        metric_card(
+                            "Ngưỡng dư",
+                            "—" if pd.isna(safe_max_value) else f"{safe_max_value:.1f} xe",
+                            f"Safety Buffer {safety:.0%}",
+                            STATUS_COLORS["Đầy xe"],
+                        )
+                    st.markdown("#### Vị trí tồn kho trong vùng an toàn")
+                    if (
+                        finite_capacity
+                        and pd.notna(bikes_value)
+                        and 0 <= float(bikes_value) <= float(capacity_value)
+                        and pd.notna(safe_min_value)
+                        and pd.notna(safe_max_value)
+                    ):
+                        utilization_pct = float(bikes_value) / float(capacity_value) * 100
+                        lower_pct = float(safe_min_value) / float(capacity_value) * 100
+                        upper_pct = float(safe_max_value) / float(capacity_value) * 100
+                        gauge = go.Figure(
+                            go.Indicator(
+                                mode="gauge+number",
+                                value=utilization_pct,
+                                number={"suffix": "%", "valueformat": ".1f"},
+                                title={"text": f"Tồn kho · {chosen.get('status', 'Chưa rõ')}"},
+                                gauge={
+                                    "axis": {"range": [0, 100], "ticksuffix": "%"},
+                                    "bar": {
+                                        "color": _status_color(
+                                            str(chosen.get("status", ""))
+                                        )
+                                    },
+                                    "steps": [
+                                        {
+                                            "range": [0, lower_pct],
+                                            "color": "#FEE2E2",
+                                        },
+                                        {
+                                            "range": [lower_pct, upper_pct],
+                                            "color": "#DCFCE7",
+                                        },
+                                        {
+                                            "range": [upper_pct, 100],
+                                            "color": "#EDE9FE",
+                                        },
+                                    ],
+                                },
+                            )
+                        )
+                        gauge.update_layout(
+                            height=230,
+                            margin={"l": 22, "r": 22, "t": 45, "b": 10},
+                            template="plotly_white",
+                        )
+                        st.plotly_chart(gauge, width="stretch")
+                        st.caption(
+                            f"Thiếu xe: dưới {lower_pct:.1f}% sức chứa · "
+                            f"Cân bằng: {lower_pct:.1f}%–{upper_pct:.1f}% · "
+                            f"Đầy xe: trên {upper_pct:.1f}%."
+                        )
+                    else:
+                        st.info(
+                            "Không thể vẽ vùng ngưỡng do tồn kho/sức chứa thiếu hoặc ngoài miền hợp lệ."
+                        )
+                    detail_rows = [
+                        ["Trạm", chosen.get("station_name", "Không rõ tên")],
+                        ["Mã trạm", chosen_station_id],
+                        ["Trạng thái", chosen.get("status", "Thiếu dữ liệu")],
+                        ["Pickups / Returns", f"{chosen.get('pickups', np.nan)} / {chosen.get('returns', np.nan)}"],
+                        ["Nguồn tồn kho", chosen.get("inventory_source", "Không rõ")],
+                        ["Nguồn sức chứa", chosen.get("capacity_source", "Không rõ")],
+                        ["Chất lượng dữ liệu", chosen.get("data_status", "Thiếu dữ liệu")],
+                        ["Cờ tồn kho ước tính", chosen.get("inventory_is_estimated", "Không rõ")],
+                        ["Cờ sức chứa ước tính", chosen.get("capacity_is_estimated", "Không rõ")],
+                        ["Cập nhật tồn kho (UTC)", _map_timestamp(chosen.get("inventory_updated_at"))],
+                        ["Cập nhật sức chứa (UTC)", _map_timestamp(chosen.get("capacity_updated_at"))],
+                    ]
+                    detail_frame = pd.DataFrame(
+                        detail_rows,
+                        columns=["Thông tin", "Nguồn / trạng thái"],
                     )
                     st.dataframe(
-                        pd.DataFrame(
-                            [
-                                ["Tồn kho / sức chứa", f"{bikes_display} / {capacity_display}"],
-                                ["Pickups / Returns", f"{chosen.get('pickups', np.nan)} / {chosen.get('returns', np.nan)}"],
-                                ["Ngưỡng an toàn", f"{chosen.get('safe_min_bikes', np.nan)} – {chosen.get('safe_max_bikes', np.nan)} xe"],
-                                ["Safety Buffer", f"{chosen.get('safety_buffer_pct', np.nan)}%"],
-                                ["Nguồn tồn kho", chosen.get("inventory_source", "Không rõ")],
-                                ["Nguồn sức chứa", chosen.get("capacity_source", "Không rõ")],
-                                ["Chất lượng dữ liệu", chosen.get("data_status", "Thiếu dữ liệu")],
-                                ["Cập nhật tồn kho", _map_timestamp(chosen.get("inventory_updated_at"))],
-                                ["Cập nhật sức chứa", _map_timestamp(chosen.get("capacity_updated_at"))],
-                            ],
-                            columns=["Thông tin", "Giá trị"],
-                        ),
+                        _style_status_table(detail_frame),
                         hide_index=True,
                         width="stretch",
                     )
-            else:
-                st.info("Chưa có trạm để xem chi tiết.")
     with tabs[1]:
         if stations.empty:
             st.info("Không có dữ liệu")
@@ -3968,14 +4823,19 @@ def main() -> None:
                     snapshot_time,
                     data_source,
                 )
-                forecast_chart(
-                    hourly,
-                    station_id,
-                    snapshot_time,
-                    data_source,
-                    forecast_data,
-                )
                 if forecast_data.empty:
+                    metric_columns = st.columns(4)
+                    for column, label in zip(
+                        metric_columns,
+                        (
+                            "Pickups dự báo t+1",
+                            "Returns dự báo t+1",
+                            "Net flow dự báo t+1",
+                            "Mốc t+1 & nguồn",
+                        ),
+                    ):
+                        with column:
+                            metric_card(label, "—", "Chưa có đầu vào hợp lệ")
                     st.info("Chưa có dữ liệu lịch sử phù hợp cho trạm này.")
                 else:
                     history_data = forecast_data.loc[
@@ -3991,6 +4851,69 @@ def main() -> None:
                         forecast_data["record_type"] == "Dự báo t+1"
                     ]
                     forecast_time = snapshot_time + pd.Timedelta(hours=1)
+                    forecast_point = (
+                        forecast_row.iloc[0]
+                        if not forecast_row.empty
+                        else pd.Series(dtype="object")
+                    )
+
+                    def format_forecast_value(column: str) -> str:
+                        number = pd.to_numeric(
+                            forecast_point.get(column), errors="coerce"
+                        )
+                        return "—" if pd.isna(number) else f"{float(number):.1f}"
+
+                    forecast_source = str(
+                        forecast_point.get(
+                            "forecast_source",
+                            "Chưa có nguồn dự báo",
+                        )
+                    )
+                    forecast_estimated = _decision_flag(
+                        forecast_point.get("is_estimated", False)
+                    )
+                    forecast_source_hint = (
+                        f"{forecast_source} · "
+                        f"{'Ước tính/fallback' if forecast_estimated else 'Nguồn đã ghi nhận'}"
+                    )
+                    forecast_metrics = st.columns(4)
+                    with forecast_metrics[0]:
+                        metric_card(
+                            "Pickups dự báo t+1",
+                            format_forecast_value("pickups_pred"),
+                            forecast_source_hint,
+                            CHART_COLORS["pickups"],
+                        )
+                    with forecast_metrics[1]:
+                        metric_card(
+                            "Returns dự báo t+1",
+                            format_forecast_value("returns_pred"),
+                            forecast_source_hint,
+                            CHART_COLORS["returns"],
+                        )
+                    with forecast_metrics[2]:
+                        metric_card(
+                            "Net flow dự báo t+1",
+                            format_forecast_value("net_flow_pred"),
+                            "Returns − pickups",
+                            CHART_COLORS["net_flow"],
+                        )
+                    with forecast_metrics[3]:
+                        metric_card(
+                            "Mốc t+1 & nguồn",
+                            f"{forecast_time:%d/%m %H:%M}",
+                            forecast_source_hint,
+                            STATUS_COLORS["Ước tính"]
+                            if forecast_estimated
+                            else STATUS_COLORS["Thông tin"],
+                        )
+                    forecast_chart(
+                        hourly,
+                        station_id,
+                        snapshot_time,
+                        data_source,
+                        forecast_data,
+                    )
                     st.caption(
                         f"Lịch sử theo giờ: 24 mốc đến {snapshot_time:%d/%m/%Y %H:%M}; "
                         f"dự báo tại t+1 = {forecast_time:%d/%m/%Y %H:%M}. "
@@ -4027,28 +4950,75 @@ def main() -> None:
                         "updated_at",
                         "source_updated_at",
                     ]
-                    st.dataframe(
-                        forecast_data[display_columns],
-                        hide_index=True,
-                        width="stretch",
+                    display_columns = [
+                        column for column in display_columns if column in forecast_data
+                    ]
+                    forecast_table = forecast_data[display_columns].copy()
+                    forecast_filter = st.text_input(
+                        "Lọc bảng theo giờ, loại bản ghi hoặc nguồn",
+                        placeholder="Ví dụ: lịch sử, t+1, fallback",
+                        key=f"uc008_table_filter_{station_id}",
+                    ).strip()
+                    if forecast_filter:
+                        matched_rows = forecast_table.astype(str).apply(
+                            lambda column: column.str.contains(
+                                forecast_filter,
+                                case=False,
+                                regex=False,
+                                na=False,
+                            )
+                        ).any(axis=1)
+                        forecast_table = forecast_table.loc[matched_rows]
+                    st.caption(
+                        f"Bảng và CSV cùng dùng bộ lọc hiện tại · "
+                        f"{len(forecast_table):,}/{len(forecast_data):,} dòng. "
+                        "Biểu đồ vẫn thể hiện toàn bộ cửa sổ 24 giờ và mốc t+1."
+                    )
+                    if forecast_table.empty:
+                        st.info("Không có dòng khớp bộ lọc.")
+                    else:
+                        st.dataframe(
+                            _style_status_table(forecast_table),
+                            hide_index=True,
+                            width="stretch",
+                        )
+                    forecast_csv = forecast_table.to_csv(index=False).encode("utf-8-sig")
+                    forecast_download_confirmed = _confirm_download(
+                        f"uc008_forecast_download_{station_id}",
+                        f"{len(forecast_table):,} dòng của bảng forecast hiện đã lọc, "
+                        "bao gồm lịch sử, dự báo t+1, nguồn, cờ ước tính và thời điểm cập nhật.",
+                        forecast_csv,
                     )
                     st.download_button(
-                        "Use Case 08: ⬇️ Tải CSV dự báo 24 giờ",
-                        forecast_data.to_csv(index=False).encode("utf-8-sig"),
+                        "Tải CSV bảng dự báo đang lọc",
+                        forecast_csv,
                         file_name=f"forecast_station_{station_id}.csv",
                         mime="text/csv",
                         width="stretch",
+                        disabled=not forecast_download_confirmed,
                     )
     with tabs[2]:
-        st.subheader("Use Case 10: Tồn kho dự kiến & mất cân bằng")
-        st.caption(
-            "Tồn kho cuối khung giờ = tồn kho đầu kỳ − dự báo lượt lấy + dự báo lượt trả; "
-            "dự báo chỉ cho t+1. Vùng an toàn dùng cùng Safety Buffer với UC009."
-        )
+        st.subheader("Đề xuất điều phối")
+        dispatch_tabs = st.tabs([
+            "Tồn kho dự kiến",
+            "Lịch trình xe tải",
+            "Phê duyệt & lịch sử quyết định",
+            "Ưu đãi & đối chiếu thực thi",
+        ])
         projected = pd.DataFrame()
-        if snapshot.empty:
-            st.info("Không có dữ liệu trạm để tính tồn kho dự kiến.")
-        else:
+        plan = pd.DataFrame(
+            columns=[
+                "route",
+                "from_station",
+                "to_station",
+                "bikes",
+                "distance_km",
+                "priority",
+            ]
+        )
+        planning_base = pd.DataFrame()
+        planning_error: str | None = None
+        if not snapshot.empty:
             try:
                 planning_base = (
                     estimated_snapshot
@@ -4064,7 +5034,12 @@ def main() -> None:
                         "forecast_returns_source",
                     ],
                     errors="ignore",
-                ).merge(forecasts, on="station_id", how="left", validate="one_to_one")
+                ).merge(
+                    forecasts,
+                    on="station_id",
+                    how="left",
+                    validate="one_to_one",
+                )
                 projected, plan = _cached_uc010_analysis(
                     planning_snapshot,
                     safety,
@@ -4078,264 +5053,44 @@ def main() -> None:
                 MemoryError,
             ) as exc:
                 projected = pd.DataFrame()
-                plan = pd.DataFrame(columns=[
-                    "route", "from_station", "to_station", "bikes",
-                        "distance_km", "priority",
-                ])
-                st.error(f"Không thể tính tồn kho dự kiến hoặc lịch trình: {exc}")
-
-            if not projected.empty:
-                projectable = projected["data_quality"].eq("Đủ dữ liệu")
-                incomplete_count = int((~projectable).sum())
-                estimated_count = int(projected["projection_is_estimated"].sum())
-                unbalanced_count = int(
-                    projected["imbalance_status"].isin(["Thiếu xe", "Dư xe"]).sum()
+                plan = pd.DataFrame(
+                    columns=[
+                        "route",
+                        "from_station",
+                        "to_station",
+                        "bikes",
+                        "distance_km",
+                        "priority",
+                    ]
                 )
-                st.caption(
-                    f"Mốc tồn kho: {snapshot_time:%d/%m/%Y %H:%M} · "
-                    f"mốc dự báo: {snapshot_time + pd.Timedelta(hours=1):%d/%m/%Y %H:%M} · "
-                    f"Safety Buffer: {safety:.0%} · "
-                    f"{projectable.sum():,}/{len(projected):,} trạm đủ đầu vào."
-                )
-                if incomplete_count:
-                    st.warning(
-                        f"{incomplete_count:,} trạm thiếu hoặc có dữ liệu đầu vào không hợp lệ; "
-                        "không được phân loại mất cân bằng hay đưa vào lịch điều phối."
-                    )
-                if estimated_count:
-                    st.info(
-                        f"{estimated_count:,} trạm có tồn kho đầu kỳ hoặc sức chứa ước tính/fallback "
-                        "hoặc chưa xác thực nguồn. Nguồn và thời điểm cập nhật được hiển thị trong bảng."
-                    )
+                planning_error = str(exc)
 
-                projection_columns = [
-                    "station_id",
-                    "station_name",
-                    "bikes_available",
-                    "forecast_pickups",
-                    "forecast_returns",
-                    "expected_stock",
-                    "safe_min_bikes",
-                    "safe_max_bikes",
-                    "imbalance_status",
-                    "data_quality",
-                    "projection_is_estimated",
-                    "inventory_is_estimated",
-                    "capacity_is_estimated",
-                    "projection_adjusted",
-                    "inventory_source",
-                    "capacity_source",
-                    "capacity_updated_at",
-                    "forecast_pickups_source",
-                    "forecast_returns_source",
-                    "inventory_updated_at",
-                    "forecast_data_updated_at",
-                    "forecast_updated_at",
-                ]
-                projection_columns = [
-                    column for column in projection_columns if column in projected.columns
-                ]
-                projection_labels = {
-                    "station_id": "Mã trạm",
-                    "station_name": "Trạm",
-                    "bikes_available": "Tồn đầu kỳ",
-                    "forecast_pickups": "Dự báo lấy",
-                    "forecast_returns": "Dự báo trả",
-                    "expected_stock": "Tồn cuối kỳ",
-                    "safe_min_bikes": "Ngưỡng thiếu",
-                    "safe_max_bikes": "Ngưỡng dư",
-                    "imbalance_status": "Mất cân bằng",
-                    "data_quality": "Chất lượng đầu vào",
-                    "projection_is_estimated": "Có dữ liệu ước tính",
-                    "inventory_is_estimated": "Tồn đầu kỳ ước tính",
-                    "capacity_is_estimated": "Sức chứa ước tính",
-                    "projection_adjusted": "Đã chặn theo biên",
-                    "inventory_source": "Nguồn tồn đầu kỳ",
-                    "capacity_source": "Nguồn sức chứa",
-                    "capacity_updated_at": "Cập nhật sức chứa",
-                    "forecast_pickups_source": "Nguồn dự báo lấy",
-                    "forecast_returns_source": "Nguồn dự báo trả",
-                    "inventory_updated_at": "Cập nhật tồn đầu kỳ",
-                    "forecast_data_updated_at": "Cập nhật station-hour",
-                    "forecast_updated_at": "Mốc dự báo",
-                }
-                with st.expander(
-                    "Use Case 10: Tồn kho dự kiến và trạng thái từng trạm",
-                    expanded=True,
-                ):
-                    st.dataframe(
-                        projected[projection_columns].rename(
-                            columns=projection_labels
-                        ),
-                        hide_index=True,
-                        width="stretch",
-                        height=360,
-                    )
-
-                st.subheader("Use Case 10/11: Lịch trình xe tải · Gom → Rải")
-                unmatched = pd.DataFrame(
-                    plan.attrs.get("unmatched_stations", [])
-                )
-                if not unmatched.empty:
-                    unmatched_labels = {
-                        "station_id": "Mã trạm",
-                        "station_name": "Trạm",
-                        "imbalance_status": "Trạng thái",
-                        "remaining_surplus": "Xe dư chưa ghép",
-                        "remaining_deficit": "Nhu cầu thiếu chưa ghép",
-                        "reason": "Lý do",
-                        "data_source": "Nguồn dữ liệu",
-                        "updated_at": "Thời điểm cập nhật",
-                        "uses_estimated_data": "Có dữ liệu ước tính",
-                    }
-                    st.warning(
-                        f"Còn {len(unmatched):,} trạm chưa ghép hết; lượng dư/thiếu này "
-                        "không được tính vào tổng xe đã lập lịch."
-                    )
-                    st.dataframe(
-                        unmatched.rename(columns=unmatched_labels),
-                        hide_index=True,
-                        width="stretch",
-                    )
-                if not projectable.any():
-                    st.warning(
-                        "Chưa đủ dự báo, tồn kho đầu kỳ hoặc sức chứa hợp lệ để lập lịch điều phối."
-                    )
-                elif plan.empty and unbalanced_count:
-                    st.warning(
-                        f"Phát hiện {unbalanced_count:,} trạm mất cân bằng nhưng chưa tạo được "
-                        "tuyến khả thi; các trạm còn lại được liệt kê ở bảng chưa ghép."
-                    )
-                elif plan.empty:
-                    st.success("Các trạm đủ dữ liệu hiện nằm trong vùng an toàn.")
-                else:
-                    route_bikes = pd.to_numeric(
-                        plan.get("bikes", pd.Series(dtype="float64")),
-                        errors="coerce",
-                    ).replace([np.inf, -np.inf], np.nan).dropna()
-                    route_distances = pd.to_numeric(
-                        plan.get("distance_km", pd.Series(dtype="float64")),
-                        errors="coerce",
-                    ).replace([np.inf, -np.inf], np.nan).dropna()
-                    scheduled_bikes = int(route_bikes.sum()) if not route_bikes.empty else 0
-                    route_count = len(plan)
-                    distance_km = float(route_distances.sum()) if not route_distances.empty else 0.0
-                    estimated_route_count = int(
-                        plan.get(
-                            "uses_estimated_data",
-                            pd.Series(False, index=plan.index),
-                        )
-                        .map(_decision_flag)
-                        .sum()
-                    )
-                    unmatched_surplus = pd.to_numeric(
-                        unmatched.get(
-                            "remaining_surplus", pd.Series(dtype="float64")
-                        ),
-                        errors="coerce",
-                    ).replace([np.inf, -np.inf], np.nan).fillna(0).sum()
-                    unmatched_deficit = pd.to_numeric(
-                        unmatched.get(
-                            "remaining_deficit", pd.Series(dtype="float64")
-                        ),
-                        errors="coerce",
-                    ).replace([np.inf, -np.inf], np.nan).fillna(0).sum()
-                    a, b = st.columns([1.5, 1])
-                    with a:
-                        plan_labels = {
-                            "route_id": "Mã tuyến",
-                            "route": "Tuyến",
-                            "from_station": "Trạm nguồn",
-                            "from_station_id": "Mã trạm nguồn",
-                            "to_station": "Trạm đích",
-                            "to_station_id": "Mã trạm đích",
-                            "bikes": "Số xe",
-                            "distance_km": "Khoảng cách (km)",
-                            "priority": "Ưu tiên",
-                            "from_data_source": "Nguồn dữ liệu trạm nguồn",
-                            "to_data_source": "Nguồn dữ liệu trạm đích",
-                            "from_updated_at": "Cập nhật trạm nguồn",
-                            "to_updated_at": "Cập nhật trạm đích",
-                            "uses_estimated_data": "Có dữ liệu ước tính",
-                        }
-                        st.dataframe(
-                            plan.rename(columns=plan_labels),
-                            hide_index=True,
-                            width="stretch",
-                        )
-                    with b:
-                        metric_card(
-                            "Tổng xe điều phối",
-                            f"{scheduled_bikes:,}",
-                            f"{route_count:,} chặng",
-                        )
-                        metric_card(
-                            "Quãng đường",
-                            f"{distance_km:.1f} km",
-                            "Greedy Haversine",
-                            "#F59E0B",
-                        )
-                        metric_card(
-                            "Xe dư / thiếu chưa ghép",
-                            f"{int(unmatched_surplus):,} / "
-                            f"{int(unmatched_deficit):,}",
-                            f"{len(unmatched):,} trạm",
-                            "#EF4444",
-                        )
-                        if estimated_route_count:
-                            st.warning(
-                                f"{estimated_route_count:,}/{route_count:,} tuyến có "
-                                "ít nhất một đầu vào ước tính/fallback. Hãy kiểm tra "
-                                "nguồn dữ liệu và thời điểm cập nhật trước khi quyết định."
-                            )
-                        if st.button(
-                            "Use Case 12: ✅ Phê duyệt Lệnh",
-                            type="primary",
-                            key="uc012_approve",
-                            width="stretch",
-                        ):
-                            try:
-                                decision_id = log_decision("APPROVED", plan)
-                            except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
-                                st.error(f"Không thể phê duyệt lệnh UC012: {exc}")
-                            else:
-                                st.success(
-                                    "Đã ghi nhận/cập nhật quyết định phê duyệt "
-                                    f"(mã `{decision_id[:12]}`)."
-                                )
-                        if st.button(
-                            "Use Case 12: ❌ Từ chối",
-                            key="uc012_reject",
-                            width="stretch",
-                        ):
-                            try:
-                                decision_id = log_decision("REJECTED", plan)
-                            except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
-                                st.error(f"Không thể từ chối lệnh UC012: {exc}")
-                            else:
-                                st.warning(
-                                    "Đã ghi nhận/cập nhật quyết định từ chối "
-                                    f"(mã `{decision_id[:12]}`)."
-                                )
-                    render_map(planning_base, plan)
-                if plan.empty:
-                    st.info(
-                        "UC012 chưa thể ghi nhận quyết định vì kế hoạch hiện không "
-                        "có tuyến điều phối hợp lệ."
-                    )
-            else:
-                st.warning("Không có kết quả dự kiến khả dụng.")
-        render_uc013_panel(projected, snapshot_time)
-        render_decision_history()
+        with dispatch_tabs[0]:
+            if planning_error:
+                st.error(f"Không thể tính tồn kho dự kiến: {planning_error}")
+            _render_uc010_projection(projected, snapshot_time, safety)
+        with dispatch_tabs[1]:
+            _render_uc011_truck_schedule(projected, plan, planning_base)
+        with dispatch_tabs[2]:
+            _render_uc012_approval(plan, snapshot_time, safety)
+        with dispatch_tabs[3]:
+            render_uc013_panel(projected, snapshot_time)
     with tabs[3]:
-        st.subheader("Use Case 01-06: ⚙️ Quản trị Backend & AI")
+        st.subheader("Pipeline & AI")
         render_data_status(data_status, "tab")
-        pipeline_tabs = st.tabs(["Use Case 01/05/06: Quản trị Pipeline Dữ liệu", "Use Case 02/03: Tiền xử lý dữ liệu"])
+        pipeline_tabs = st.tabs([
+            "Nạp dữ liệu",
+            "Tiền xử lý dữ liệu",
+            "Thu thập snapshot trạm GBFS",
+            "Tạo đặc trưng / Features",
+            "Huấn luyện mô hình LightGBM",
+            "So sánh Baseline Benchmark",
+        ])
         with pipeline_tabs[0]:
-            st.markdown("#### Use Case 01/05/06: Quản trị Pipeline Dữ liệu")
+            st.markdown("#### Nạp & kiểm kê dữ liệu nguồn")
             if st.session_state.get("uc1_activation_message"):
                 st.success(st.session_state["uc1_activation_message"])
-            with st.expander("Use Case 01: 📁 Danh sách toàn bộ file CSV đang sử dụng", expanded=False):
+            with st.expander("📁 Danh sách file CSV đang sử dụng", expanded=False):
                 csv_inventory = list_project_csv_files(loaded_only=True)
                 if csv_inventory.empty:
                     st.info("Không tìm thấy file CSV hợp lệ trong thư mục data_load/.")
@@ -4352,7 +5107,7 @@ def main() -> None:
                         width="stretch",
                         height=320,
                     )
-            with st.expander("Use Case 01: ⚠️ Danh sách file CSV không sử dụng được", expanded=False):
+            with st.expander("⚠️ Danh sách file CSV không sử dụng được", expanded=False):
                 if UC1_REJECTED_CSV_PATH.exists():
                     try:
                         rejected_csv = json.loads(UC1_REJECTED_CSV_PATH.read_text(encoding="utf-8"))
@@ -4382,7 +5137,7 @@ def main() -> None:
                         st.info("Không có file CSV nào bị loại khỏi quá trình xử lý.")
                 else:
                     st.info("Chưa có thông tin file CSV không sử dụng được.")
-            with st.expander("Use Case 01: 🗑️ Xóa file CSV đã load", expanded=False):
+            with st.expander("🗑️ Xóa file CSV đã load", expanded=False):
                 loaded_csv_inventory = list_project_csv_files(loaded_only=True)
                 if loaded_csv_inventory.empty:
                     st.info("Không có file CSV đã load để xóa.")
@@ -4403,7 +5158,7 @@ def main() -> None:
                             key="confirm_delete_loaded_csv",
                         )
                         if st.button(
-                            "Use Case 01: 🗑️ Xác nhận xóa file đã chọn",
+                            "Xác nhận xóa file đã chọn",
                             type="secondary",
                             disabled=not confirm_delete,
                             key="delete_selected_loaded_csv",
@@ -4436,11 +5191,11 @@ def main() -> None:
                 f"Nguồn gốc: `{DATA_DIRECTORY}` · "
                 f"bản sao load: `{DATA_LOAD_DIRECTORY}` · chỉ quét các file `.csv`"
             )
-            load_data_clicked = st.button(
-                "Use Case 01: 📥 Load Data",
-                type="primary",
-                key="uc1_load_data",
-                width="stretch",
+            load_data_clicked = _confirm_action(
+                "uc1_load_data",
+                "Chuẩn bị nạp dữ liệu CSV",
+                "Thao tác sẽ sao chép CSV hợp lệ từ data/ sang data_load/ và cập nhật "
+                "các artifact nạp dữ liệu trong processed/. Chỉ tiếp tục khi đã chọn đúng nguồn.",
             )
             if load_data_clicked:
                 progress_bar = st.progress(0, text="Đang chuẩn bị nạp dữ liệu...")
@@ -4524,13 +5279,15 @@ def main() -> None:
                     st.error("Không tìm thấy dữ liệu hợp lệ trong thư mục data_load/. Vui lòng kiểm tra lại đường dẫn!")
             else:
                 st.info("Không có dữ liệu")
-        with pipeline_tabs[0]:
+        with pipeline_tabs[3]:
+            st.markdown("#### Tạo đặc trưng / Features")
             if data_source == "Không có dữ liệu":
                 st.info("Không có dữ liệu")
             else:
-                build_features_clicked = st.button(
-                    "Use Case 04: 🧩 Build Features",
-                    width="stretch",
+                build_features_clicked = _confirm_action(
+                    "uc4_build_features",
+                    "Chuẩn bị tạo features",
+                    f"Sẽ tính lại và ghi artifact {FEATURES_PATH.name} từ station-hour đã xử lý.",
                 )
                 if build_features_clicked:
                     with st.spinner("Đang tạo temporal, lag và rolling features..."):
@@ -4562,9 +5319,40 @@ def main() -> None:
                             st.dataframe(features.head(5), hide_index=True, width="stretch")
                         except (OSError, ImportError, RuntimeError, ValueError) as exc:
                             st.error(f"Không thể tạo features: {exc}")
-                retrain_clicked = st.button(
-                    "Use Case 05: 🧠 Retrain LightGBM Model",
-                    width="stretch",
+                uc4_state = persistent_state.get("uc4")
+                if (
+                    not build_features_clicked
+                    and isinstance(uc4_state, dict)
+                    and FEATURES_PATH.exists()
+                ):
+                    st.success(
+                        f"Đã khôi phục {int(uc4_state.get('rows', 0)):,} dòng feature."
+                    )
+                    feature_stats = uc4_state.get("feature_stats", {})
+                    if isinstance(feature_stats, dict):
+                        st.caption(
+                            "Số giờ station-hour bị thiếu: "
+                            f"{int(feature_stats.get('hour_gaps', 0)):,} · "
+                            "Dòng thiếu lịch sử: "
+                            f"{int(feature_stats.get('rows_missing_history', 0)):,} · "
+                            "Dòng bị loại do thiếu lịch sử: "
+                            f"{int(feature_stats.get('rows_dropped_missing_history', 0)):,}"
+                        )
+                    st.dataframe(
+                        _persisted_preview(uc4_state, "preview"),
+                        hide_index=True,
+                        width="stretch",
+                    )
+        with pipeline_tabs[4]:
+            st.markdown("#### Huấn luyện mô hình LightGBM")
+            if data_source == "Không có dữ liệu":
+                st.info("Không có dữ liệu")
+            else:
+                retrain_clicked = _confirm_action(
+                    "uc5_retrain_models",
+                    "Chuẩn bị huấn luyện LightGBM",
+                    "Sẽ huấn luyện lại và thay thế lgb_pickups.pkl cùng lgb_returns.pkl "
+                    "trong thư mục models/.",
                 )
                 if retrain_clicked:
                     with st.spinner("Chronological split 70/15/15 và huấn luyện..."):
@@ -4572,7 +5360,7 @@ def main() -> None:
                             if not FEATURES_PATH.is_file():
                                 raise FileNotFoundError(
                                     "Chưa có station_features.parquet. "
-                                    "Hãy chạy Use Case 04: Build Features trước."
+                                    "Hãy chạy Build Features trước."
                                 )
                             metrics = train_models(FEATURES_PATH, MODELS)
                             persistent_state = _persist_use_case_result(
@@ -4602,9 +5390,29 @@ def main() -> None:
                             MemoryError,
                         ) as exc:
                             st.error(f"Không thể huấn luyện model: {exc}")
-                benchmark_clicked = st.button(
-                    "Use Case 06: 📏 Run Baseline Benchmark",
-                    width="stretch",
+                uc5_state = persistent_state.get("uc5")
+                if (
+                    not retrain_clicked
+                    and isinstance(uc5_state, dict)
+                    and all(
+                        (MODELS / name).exists()
+                        for name in ("lgb_pickups.pkl", "lgb_returns.pkl")
+                    )
+                ):
+                    st.success("Đã khôi phục trạng thái mô hình và các chỉ số đánh giá.")
+                    st.dataframe(
+                        pd.DataFrame(uc5_state.get("metrics", {})).T,
+                        width="stretch",
+                    )
+        with pipeline_tabs[5]:
+            st.markdown("#### So sánh Baseline Benchmark")
+            if data_source == "Không có dữ liệu":
+                st.info("Không có dữ liệu")
+            else:
+                benchmark_clicked = _confirm_action(
+                    "uc6_run_benchmark",
+                    "Chuẩn bị chạy Baseline Benchmark",
+                    f"Sẽ chạy so sánh baseline và ghi đè {BENCHMARK_PATH.name} trong processed/.",
                 )
                 if benchmark_clicked:
                     with st.spinner("Đang so sánh Historical Average, Seasonal Naive và LightGBM..."):
@@ -4612,7 +5420,7 @@ def main() -> None:
                             if not FEATURES_PATH.is_file():
                                 raise FileNotFoundError(
                                     "Chưa có station_features.parquet. "
-                                    "Hãy chạy Use Case 04: Build Features trước."
+                                    "Hãy chạy Build Features trước."
                                 )
                             benchmark = benchmark_models(FEATURES_PATH, MODELS)
                             benchmark.to_csv(BENCHMARK_PATH, index=False)
@@ -4624,11 +5432,20 @@ def main() -> None:
                                 },
                             )
                             st.dataframe(benchmark, hide_index=True, width="stretch")
+                            benchmark_csv = benchmark.to_csv(index=False).encode(
+                                "utf-8-sig"
+                            )
+                            benchmark_download_confirmed = _confirm_download(
+                                "uc6_benchmark_download",
+                                "Bảng benchmark vừa tính, bao gồm các chỉ số so sánh baseline và LightGBM.",
+                                benchmark_csv,
+                            )
                             st.download_button(
-                                "Use Case 06: ⬇️ Tải benchmark CSV",
-                                benchmark.to_csv(index=False).encode("utf-8-sig"),
+                                "Tải benchmark CSV",
+                                benchmark_csv,
                                 file_name="bikemind_benchmark.csv",
                                 mime="text/csv",
+                                disabled=not benchmark_download_confirmed,
                             )
                         except (
                             duckdb.Error,
@@ -4640,41 +5457,6 @@ def main() -> None:
                             MemoryError,
                         ) as exc:
                             st.error(f"Không thể benchmark model: {exc}")
-                uc4_state = persistent_state.get("uc4")
-                if (
-                    not build_features_clicked
-                    and isinstance(uc4_state, dict)
-                    and FEATURES_PATH.exists()
-                ):
-                    st.success(
-                        f"Use Case 04 đã khôi phục: {int(uc4_state.get('rows', 0)):,} dòng feature."
-                    )
-                    feature_stats = uc4_state.get("feature_stats", {})
-                    if isinstance(feature_stats, dict):
-                        st.caption(
-                            "Số giờ station-hour bị thiếu: "
-                            f"{int(feature_stats.get('hour_gaps', 0)):,} · "
-                            "Dòng thiếu lịch sử: "
-                            f"{int(feature_stats.get('rows_missing_history', 0)):,} · "
-                            "Dòng bị loại do thiếu lịch sử: "
-                            f"{int(feature_stats.get('rows_dropped_missing_history', 0)):,}"
-                        )
-                    st.dataframe(
-                        _persisted_preview(uc4_state, "preview"),
-                        hide_index=True,
-                        width="stretch",
-                    )
-                uc5_state = persistent_state.get("uc5")
-                if (
-                    not retrain_clicked
-                    and isinstance(uc5_state, dict)
-                    and all((MODELS / name).exists() for name in ("lgb_pickups.pkl", "lgb_returns.pkl"))
-                ):
-                    st.success("Use Case 05 đã khôi phục: lgb_pickups.pkl và lgb_returns.pkl.")
-                    st.dataframe(
-                        pd.DataFrame(uc5_state.get("metrics", {})).T,
-                        width="stretch",
-                    )
                 uc6_state = persistent_state.get("uc6")
                 if (
                     not benchmark_clicked
@@ -4682,27 +5464,33 @@ def main() -> None:
                     and BENCHMARK_PATH.exists()
                 ):
                     benchmark = pd.read_csv(BENCHMARK_PATH)
-                    st.success("Use Case 06 đã khôi phục từ benchmark đã lưu.")
+                    st.success("Đã khôi phục benchmark gần nhất đã lưu.")
                     st.dataframe(benchmark, hide_index=True, width="stretch")
+                    benchmark_csv = benchmark.to_csv(index=False).encode("utf-8-sig")
+                    benchmark_download_confirmed = _confirm_download(
+                        "uc6_restored_benchmark_download",
+                        "Bảng benchmark gần nhất đang lưu trong processed/.",
+                        benchmark_csv,
+                    )
                     st.download_button(
-                        "Use Case 06: ⬇️ Tải benchmark CSV",
-                        benchmark.to_csv(index=False).encode("utf-8-sig"),
+                        "Tải benchmark CSV",
+                        benchmark_csv,
                         file_name="bikemind_benchmark.csv",
                         mime="text/csv",
                         key="restored_benchmark_download",
+                        disabled=not benchmark_download_confirmed,
                     )
-            if data_source == "Không có dữ liệu":
-                st.info("Không có dữ liệu")
-            else:
-                st.subheader("Use Case 06: Benchmark")
-                st.caption("Nhấn Run Baseline Benchmark để tính lại trên dữ liệu hiện tại.")
+            st.caption(
+                "So sánh Historical Average, Seasonal Naive và LightGBM "
+                "trên dữ liệu hiện tại."
+            )
         with pipeline_tabs[1]:
-            st.markdown("#### Use Case 02: Tiền xử lý dữ liệu")
-            clean_data_clicked = st.button(
-                "Use Case 02: 🧹 Khởi chạy Data Cleaning & Zero-Filling Pipeline",
-                type="primary",
-                key="uc2_clean_data",
-                width="stretch",
+            st.markdown("#### Tiền xử lý dữ liệu")
+            clean_data_clicked = _confirm_action(
+                "uc2_clean_data",
+                "Chuẩn bị làm sạch & zero-fill",
+                "Thao tác sẽ cập nhật station_hour_cleaned và station_metadata trong processed/. "
+                "Nguồn đầu vào là bản nạp CSV hiện tại.",
             )
             if clean_data_clicked:
                 with st.spinner(
@@ -4746,14 +5534,15 @@ def main() -> None:
                 stats = uc2_state.get("stats", {})
                 if not isinstance(stats, dict):
                     stats = {}
-                st.success("Use Case 02 đã khôi phục từ dữ liệu đã xử lý.")
+                st.success("Đã khôi phục kết quả tiền xử lý từ dữ liệu đã xử lý.")
                 _render_uc2_audit(stats, _persisted_preview(uc2_state, "preview"))
-            st.markdown("#### Use Case 03: GBFS Station Status Collector")
-            collect_gbfs_clicked = st.button(
-                "Use Case 03: 🛰️ Kết nối GBFS & Thu thập Snapshot Trạm",
-                type="primary",
-                key="uc3_collect_gbfs",
-                width="stretch",
+        with pipeline_tabs[2]:
+            st.markdown("#### GBFS Station Status Collector")
+            collect_gbfs_clicked = _confirm_action(
+                "uc3_collect_gbfs",
+                "Chuẩn bị thu thập snapshot GBFS",
+                "Thao tác sẽ gọi endpoint GBFS công khai và ghi snapshot mới vào SQLite; "
+                "các bản ghi lịch sử được giữ theo cơ chế hiện có.",
             )
             if collect_gbfs_clicked:
                 with st.spinner(
@@ -4789,7 +5578,7 @@ def main() -> None:
                 and DB_PATH.exists()
             ):
                 st.success(
-                    "Kết quả thu thập Use Case 03 đã lưu gần nhất: "
+                    "Kết quả thu thập snapshot đã lưu gần nhất: "
                     f"{int(uc3_state.get('records_count', 0)):,} trạm · "
                     f"{uc3_state.get('timestamp', 'Không rõ thời điểm')}."
                 )
@@ -4801,211 +5590,226 @@ def main() -> None:
                     width="stretch",
                 )
     with tabs[4]:
-        render_system_health()
-        st.divider()
-        st.subheader("Use Case 15: Historical Backtesting & Report")
-        st.caption(
-            "Báo cáo được lưu trong processed/; DSS phải có tỷ lệ sức chứa cao hơn baseline. "
-            "Ghi đè chỉ diễn ra sau bước xác nhận."
-        )
-        input_error = _backtesting_input_error(hourly, stations)
-        if input_error:
-            st.warning(f"Chưa thể chạy báo cáo: {input_error}")
-
-        ratio_columns = st.columns(2)
-        with ratio_columns[0]:
-            passive_capacity_percent = st.slider(
-                "Baseline: tỷ lệ sức chứa khả dụng",
-                min_value=0,
-                max_value=100,
-                value=55,
-                step=5,
-                format="%d%%",
-                key="uc15_baseline_capacity_ratio",
+        system_tabs = st.tabs(["Sức khỏe hệ thống & provenance", "Mô phỏng & báo cáo"])
+        with system_tabs[0]:
+            render_system_health()
+        with system_tabs[1]:
+            st.divider()
+            st.subheader("Mô phỏng & báo cáo")
+            st.caption(
+                "Báo cáo được lưu trong processed/; DSS phải có tỷ lệ sức chứa cao hơn baseline. "
+                "Ghi đè chỉ diễn ra sau bước xác nhận."
             )
-        with ratio_columns[1]:
-            dss_capacity_percent = st.slider(
-                "BikeMind DSS: tỷ lệ sức chứa khả dụng",
-                min_value=0,
-                max_value=100,
-                value=75,
-                step=5,
-                format="%d%%",
-                key="uc15_dss_capacity_ratio",
-            )
-        passive_capacity_ratio = passive_capacity_percent / 100
-        dss_capacity_ratio = dss_capacity_percent / 100
-        ratio_error = None
-        try:
-            passive_capacity_ratio, dss_capacity_ratio = _validate_backtesting_ratios(
-                passive_capacity_ratio,
-                dss_capacity_ratio,
-            )
-        except ValueError as exc:
-            ratio_error = str(exc)
-            st.warning(ratio_error)
+            input_error = _backtesting_input_error(hourly, stations)
+            if input_error:
+                st.warning(f"Chưa thể chạy báo cáo: {input_error}")
 
-        pending_key = "uc15_backtesting_pending_confirmation"
-        can_run_backtesting = input_error is None and ratio_error is None
-        if not st.session_state.get(pending_key, False):
-            if st.button(
-                "Use Case 15: Chuẩn bị chạy mô phỏng",
-                type="primary",
-                key="uc15_prepare_backtesting",
-                disabled=not can_run_backtesting,
-            ):
-                st.session_state[pending_key] = True
-
-        pending_confirmation = bool(st.session_state.get(pending_key, False))
-        if pending_confirmation:
-            if BACKTESTING_PATH.is_file():
-                st.warning(
-                    f"Xác nhận để thay thế báo cáo hiện có: {BACKTESTING_PATH}."
+            ratio_columns = st.columns(2)
+            with ratio_columns[0]:
+                passive_capacity_percent = st.slider(
+                    "Baseline: tỷ lệ sức chứa khả dụng",
+                    min_value=0,
+                    max_value=100,
+                    value=55,
+                    step=5,
+                    format="%d%%",
+                    key="uc15_baseline_capacity_ratio",
                 )
-            else:
-                st.warning(
-                    "Xác nhận để chạy mô phỏng và ghi báo cáo vào processed/."
+            with ratio_columns[1]:
+                dss_capacity_percent = st.slider(
+                    "BikeMind DSS: tỷ lệ sức chứa khả dụng",
+                    min_value=0,
+                    max_value=100,
+                    value=75,
+                    step=5,
+                    format="%d%%",
+                    key="uc15_dss_capacity_ratio",
                 )
-            confirm_column, cancel_column = st.columns(2)
-            with confirm_column:
-                confirm_backtesting = st.button(
-                    "Xác nhận chạy và ghi báo cáo",
-                    key="uc15_confirm_backtesting",
+            passive_capacity_ratio = passive_capacity_percent / 100
+            dss_capacity_ratio = dss_capacity_percent / 100
+            ratio_error = None
+            try:
+                passive_capacity_ratio, dss_capacity_ratio = _validate_backtesting_ratios(
+                    passive_capacity_ratio,
+                    dss_capacity_ratio,
+                )
+            except ValueError as exc:
+                ratio_error = str(exc)
+                st.warning(ratio_error)
+
+            pending_key = "uc15_backtesting_pending_confirmation"
+            can_run_backtesting = input_error is None and ratio_error is None
+            if not st.session_state.get(pending_key, False):
+                if st.button(
+                    "Chuẩn bị chạy mô phỏng",
+                    type="primary",
+                    key="uc15_prepare_backtesting",
                     disabled=not can_run_backtesting,
-                )
-            with cancel_column:
-                cancel_backtesting = st.button(
-                    "Hủy",
-                    key="uc15_cancel_backtesting",
-                )
-            if cancel_backtesting:
-                st.session_state[pending_key] = False
-                st.info("Đã hủy thao tác; báo cáo hiện có không bị thay đổi.")
-            elif confirm_backtesting:
-                st.session_state[pending_key] = False
-                try:
-                    input_updated_at = _backtesting_input_updated_at(data_source)
-                    scenario = run_historical_simulation(
-                        hourly,
-                        stations,
-                        passive_capacity_ratio=passive_capacity_ratio,
-                        dss_capacity_ratio=dss_capacity_ratio,
-                        data_source=data_source,
-                        input_updated_at=input_updated_at,
+                ):
+                    st.session_state[pending_key] = True
+
+            pending_confirmation = bool(st.session_state.get(pending_key, False))
+            if pending_confirmation:
+                if BACKTESTING_PATH.is_file():
+                    st.warning(
+                        f"Xác nhận để thay thế báo cáo hiện có: {BACKTESTING_PATH}."
                     )
-                    baseline, dss, improvement = _backtesting_summary(scenario)
-                    report_bytes = _backtesting_csv_bytes(scenario)
-                    _write_backtesting_report(BACKTESTING_PATH, report_bytes)
-                    _cached_backtesting_report.clear()
-                except (
-                    OSError,
-                    duckdb.Error,
-                    ImportError,
-                    ValueError,
-                    TypeError,
-                    KeyError,
-                    IndexError,
-                    AttributeError,
-                    RuntimeError,
-                    MemoryError,
-                    OverflowError,
-                    FloatingPointError,
-                ) as exc:
-                    st.error(f"Không thể chạy hoặc lưu báo cáo UC015: {exc}")
                 else:
+                    st.warning(
+                        "Xác nhận để chạy mô phỏng và ghi báo cáo vào processed/."
+                    )
+                confirm_column, cancel_column = st.columns(2)
+                with confirm_column:
+                    confirm_backtesting = st.button(
+                        "Xác nhận chạy và ghi báo cáo",
+                        key="uc15_confirm_backtesting",
+                        disabled=not can_run_backtesting,
+                    )
+                with cancel_column:
+                    cancel_backtesting = st.button(
+                        "Hủy",
+                        key="uc15_cancel_backtesting",
+                    )
+                if cancel_backtesting:
+                    st.session_state[pending_key] = False
+                    st.info("Đã hủy thao tác; báo cáo hiện có không bị thay đổi.")
+                elif confirm_backtesting:
+                    st.session_state[pending_key] = False
                     try:
-                        persistent_state = _persist_use_case_result(
-                            "uc14_15",
-                            {
-                                "artifact": BACKTESTING_PATH.name,
-                                "preview": _frame_preview(scenario),
-                                "data_source": data_source,
-                                "input_updated_at": input_updated_at,
-                                "baseline_capacity_ratio": passive_capacity_ratio,
-                                "dss_capacity_ratio": dss_capacity_ratio,
-                            },
+                        input_updated_at = _backtesting_input_updated_at(data_source)
+                        scenario = run_historical_simulation(
+                            hourly,
+                            stations,
+                            passive_capacity_ratio=passive_capacity_ratio,
+                            dss_capacity_ratio=dss_capacity_ratio,
+                            data_source=data_source,
+                            input_updated_at=input_updated_at,
                         )
-                    except (OSError, RuntimeError, TypeError, ValueError) as exc:
-                        st.error(
-                            "Báo cáo đã được ghi nhưng không thể cập nhật trạng thái Use Case: "
-                            f"{exc}"
-                        )
-                    st.dataframe(scenario, hide_index=True, width="stretch")
-                    st.success(
-                        f"Scenario B giảm unmet demand {improvement:.1f}% so với baseline "
-                        f"(baseline {baseline:,.2f}; DSS {dss:,.2f}). "
-                        f"Đã lưu: {BACKTESTING_PATH.name}."
-                    )
-                    st.download_button(
-                        "Use Case 15: ⬇️ Tải báo cáo backtesting",
-                        report_bytes,
-                        file_name="bikemind_backtesting_report.csv",
-                        mime="text/csv",
-                        key="backtesting_download",
-                    )
-        else:
-            if BACKTESTING_PATH.is_file():
-                try:
-                    scenario = _load_backtesting_report(BACKTESTING_PATH)
-                    _, _, improvement = _backtesting_summary(scenario)
-                    report_bytes = _backtesting_csv_bytes(scenario)
-                except (
-                    OSError,
-                    pd.errors.EmptyDataError,
-                    pd.errors.ParserError,
-                    ValueError,
-                    TypeError,
-                    KeyError,
-                    IndexError,
-                    AttributeError,
-                    RuntimeError,
-                ) as exc:
-                    st.error(f"Không thể khôi phục báo cáo backtesting UC015: {exc}")
-                else:
-                    st.success("Use Case 15 đã khôi phục báo cáo backtesting đã lưu.")
-                    if {
-                        "Baseline Capacity Ratio",
-                        "DSS Capacity Ratio",
-                    }.issubset(scenario.columns):
+                        baseline, dss, improvement = _backtesting_summary(scenario)
+                        report_bytes = _backtesting_csv_bytes(scenario)
+                        _write_backtesting_report(BACKTESTING_PATH, report_bytes)
+                        _cached_backtesting_report.clear()
+                    except (
+                        OSError,
+                        duckdb.Error,
+                        ImportError,
+                        ValueError,
+                        TypeError,
+                        KeyError,
+                        IndexError,
+                        AttributeError,
+                        RuntimeError,
+                        MemoryError,
+                        OverflowError,
+                        FloatingPointError,
+                    ) as exc:
+                        st.error(f"Không thể chạy hoặc lưu báo cáo UC015: {exc}")
+                    else:
                         try:
-                            saved_baseline_ratio = float(
-                                scenario["Baseline Capacity Ratio"].iloc[0]
+                            persistent_state = _persist_use_case_result(
+                                "uc14_15",
+                                {
+                                    "artifact": BACKTESTING_PATH.name,
+                                    "preview": _frame_preview(scenario),
+                                    "data_source": data_source,
+                                    "input_updated_at": input_updated_at,
+                                    "baseline_capacity_ratio": passive_capacity_ratio,
+                                    "dss_capacity_ratio": dss_capacity_ratio,
+                                },
                             )
-                            saved_dss_ratio = float(
-                                scenario["DSS Capacity Ratio"].iloc[0]
+                        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                            st.error(
+                                "Báo cáo đã được ghi nhưng không thể cập nhật trạng thái Use Case: "
+                                f"{exc}"
                             )
-                        except (TypeError, ValueError, OverflowError, IndexError):
-                            saved_baseline_ratio = float("nan")
-                            saved_dss_ratio = float("nan")
-                        if (
-                            math.isfinite(saved_baseline_ratio)
-                            and math.isfinite(saved_dss_ratio)
-                            and (
-                                not math.isclose(
-                                    saved_baseline_ratio,
-                                    passive_capacity_ratio,
+                        st.dataframe(scenario, hide_index=True, width="stretch")
+                        st.success(
+                            f"Scenario B giảm unmet demand {improvement:.1f}% so với baseline "
+                            f"(baseline {baseline:,.2f}; DSS {dss:,.2f}). "
+                            f"Đã lưu: {BACKTESTING_PATH.name}."
+                        )
+                        report_download_confirmed = _confirm_download(
+                            "uc15_backtesting_download",
+                            "Báo cáo Scenario A/B vừa chạy, gồm kết quả, tỷ lệ sức chứa và provenance đầu vào.",
+                            report_bytes,
+                        )
+                        st.download_button(
+                            "Tải báo cáo backtesting",
+                            report_bytes,
+                            file_name="bikemind_backtesting_report.csv",
+                            mime="text/csv",
+                            key="backtesting_download",
+                            disabled=not report_download_confirmed,
+                        )
+            else:
+                if BACKTESTING_PATH.is_file():
+                    try:
+                        scenario = _load_backtesting_report(BACKTESTING_PATH)
+                        _, _, improvement = _backtesting_summary(scenario)
+                        report_bytes = _backtesting_csv_bytes(scenario)
+                    except (
+                        OSError,
+                        pd.errors.EmptyDataError,
+                        pd.errors.ParserError,
+                        ValueError,
+                        TypeError,
+                        KeyError,
+                        IndexError,
+                        AttributeError,
+                        RuntimeError,
+                    ) as exc:
+                        st.error(f"Không thể khôi phục báo cáo backtesting UC015: {exc}")
+                    else:
+                        st.success("Đã khôi phục báo cáo backtesting đã lưu.")
+                        if {
+                            "Baseline Capacity Ratio",
+                            "DSS Capacity Ratio",
+                        }.issubset(scenario.columns):
+                            try:
+                                saved_baseline_ratio = float(
+                                    scenario["Baseline Capacity Ratio"].iloc[0]
                                 )
-                                or not math.isclose(
-                                    saved_dss_ratio,
-                                    dss_capacity_ratio,
+                                saved_dss_ratio = float(
+                                    scenario["DSS Capacity Ratio"].iloc[0]
                                 )
-                            )
-                        ):
-                            st.info(
-                                "Đang xem báo cáo đã lưu với tham số cũ; thay đổi slider "
-                                "chưa được áp dụng cho tới khi xác nhận chạy lại."
-                            )
-                    st.dataframe(scenario, hide_index=True, width="stretch")
-                    st.info(f"Scenario B giảm unmet demand {improvement:.1f}% so với baseline.")
-                    st.download_button(
-                        "Use Case 15: ⬇️ Tải báo cáo backtesting",
-                        report_bytes,
-                        file_name="bikemind_backtesting_report.csv",
-                        mime="text/csv",
-                        key="restored_backtesting_download",
-                    )
-            elif input_error is None:
-                st.info("Chuẩn bị mô phỏng để so sánh hai kịch bản vận hành.")
+                            except (TypeError, ValueError, OverflowError, IndexError):
+                                saved_baseline_ratio = float("nan")
+                                saved_dss_ratio = float("nan")
+                            if (
+                                math.isfinite(saved_baseline_ratio)
+                                and math.isfinite(saved_dss_ratio)
+                                and (
+                                    not math.isclose(
+                                        saved_baseline_ratio,
+                                        passive_capacity_ratio,
+                                    )
+                                    or not math.isclose(
+                                        saved_dss_ratio,
+                                        dss_capacity_ratio,
+                                    )
+                                )
+                            ):
+                                st.info(
+                                    "Đang xem báo cáo đã lưu với tham số cũ; thay đổi slider "
+                                    "chưa được áp dụng cho tới khi xác nhận chạy lại."
+                                )
+                        st.dataframe(scenario, hide_index=True, width="stretch")
+                        st.info(f"Scenario B giảm unmet demand {improvement:.1f}% so với baseline.")
+                        report_download_confirmed = _confirm_download(
+                            "uc15_restored_backtesting_download",
+                            "Báo cáo UC015 hiện có trong processed/, bao gồm nguồn và cờ ước tính nếu có.",
+                            report_bytes,
+                        )
+                        st.download_button(
+                            "Tải báo cáo backtesting",
+                            report_bytes,
+                            file_name="bikemind_backtesting_report.csv",
+                            mime="text/csv",
+                            key="restored_backtesting_download",
+                            disabled=not report_download_confirmed,
+                        )
+                elif input_error is None:
+                    st.info("Chuẩn bị mô phỏng để so sánh hai kịch bản vận hành.")
 
 
 if __name__ == "__main__":
