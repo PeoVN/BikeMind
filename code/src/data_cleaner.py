@@ -42,47 +42,143 @@ def _normalise_trip_columns(trips: pd.DataFrame) -> pd.DataFrame:
     return trips.rename(columns=rename)
 
 
-def clean_trips(trips: pd.DataFrame) -> pd.DataFrame:
+def _clean_trips_with_stats(
+    trips: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    stats = {
+        "input_rows": len(trips),
+        "removed_invalid_timestamp": 0,
+        "removed_missing_station_id": 0,
+        "removed_invalid_coordinates": 0,
+        "removed_time_order": 0,
+        "removed_duration": 0,
+        "removed_same_station_short": 0,
+        "removed_duplicate_rows": 0,
+    }
     if trips.empty:
-        return trips.copy()
+        return trips.copy(), stats
     frame = _normalise_trip_columns(trips.copy())
     required = [
         "start_time", "end_time", "trip_duration",
         "start_station_id", "end_station_id",
+        "start_lat", "start_lon", "end_lat", "end_lon",
     ]
     missing = [column for column in required if column not in frame.columns]
     if missing:
         raise ValueError("Thiếu cột bắt buộc cho UC02: " + ", ".join(missing))
+
     frame["start_time"] = pd.to_datetime(frame["start_time"], errors="coerce")
     frame["end_time"] = pd.to_datetime(frame["end_time"], errors="coerce")
     frame["trip_duration"] = pd.to_numeric(frame["trip_duration"], errors="coerce")
     frame["start_station_id"] = pd.to_numeric(frame["start_station_id"], errors="coerce")
     frame["end_station_id"] = pd.to_numeric(frame["end_station_id"], errors="coerce")
-    frame = frame.dropna(subset=required)
+    for column in ("start_lat", "start_lon", "end_lat", "end_lon"):
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+
+    def retain(mask: pd.Series, stat_key: str) -> None:
+        nonlocal frame
+        stats[stat_key] = int((~mask).sum())
+        frame = frame.loc[mask].copy()
+
+    valid_timestamps = frame["start_time"].notna() & frame["end_time"].notna()
+    retain(valid_timestamps, "removed_invalid_timestamp")
+
+    int32_info = np.iinfo(np.int32)
+    valid_station_ids = pd.Series(True, index=frame.index)
+    for column in ("start_station_id", "end_station_id"):
+        values = frame[column].to_numpy(dtype=float, na_value=np.nan)
+        valid_station_ids &= (
+            pd.Series(
+                np.isfinite(values)
+                & (values >= int32_info.min)
+                & (values <= int32_info.max)
+                & (values == np.floor(values)),
+                index=frame.index,
+            )
+        )
+    retain(valid_station_ids, "removed_missing_station_id")
+
+    valid_coordinates = pd.Series(True, index=frame.index)
+    for column, lower, upper in (
+        ("start_lat", -90, 90),
+        ("end_lat", -90, 90),
+        ("start_lon", -180, 180),
+        ("end_lon", -180, 180),
+    ):
+        values = frame[column].to_numpy(dtype=float, na_value=np.nan)
+        valid_coordinates &= pd.Series(
+            np.isfinite(values) & (values >= lower) & (values <= upper),
+            index=frame.index,
+        )
+    retain(valid_coordinates, "removed_invalid_coordinates")
+
+    valid_time_order = frame["end_time"] > frame["start_time"]
+    retain(valid_time_order, "removed_time_order")
+
+    valid_duration = frame["trip_duration"].between(60, 7200, inclusive="both")
+    retain(valid_duration, "removed_duration")
+
     frame["start_station_id"] = frame["start_station_id"].astype("int32")
     frame["end_station_id"] = frame["end_station_id"].astype("int32")
-    frame = frame[frame["trip_duration"].between(60, 7200)]
-    frame = frame[frame["end_time"] > frame["start_time"]]
-    frame = frame[
-        ~(
-            (frame["start_station_id"] == frame["end_station_id"])
-            & (frame["trip_duration"] < 180)
-        )
-    ]
-    return frame.drop_duplicates().reset_index(drop=True)
+    valid_station_visit = ~(
+        (frame["start_station_id"] == frame["end_station_id"])
+        & (frame["trip_duration"] < 180)
+    )
+    retain(valid_station_visit, "removed_same_station_short")
+
+    duplicate_count = len(frame) - len(frame.drop_duplicates())
+    stats["removed_duplicate_rows"] = duplicate_count
+    frame = frame.drop_duplicates().reset_index(drop=True)
+    stats["clean_rows"] = len(frame)
+    stats["removed_rows"] = stats["input_rows"] - len(frame)
+    return frame, stats
+
+
+def clean_trips(trips: pd.DataFrame) -> pd.DataFrame:
+    cleaned, _ = _clean_trips_with_stats(trips)
+    return cleaned
 
 
 def build_station_metadata(trips: pd.DataFrame) -> pd.DataFrame:
     """Derive station coordinates and capacities when no static table exists."""
     if trips.empty:
-        return pd.DataFrame(columns=["station_id", "station_name", "lat", "lon", "capacity"])
+        return pd.DataFrame(
+            columns=[
+                "station_id",
+                "station_name",
+                "lat",
+                "lon",
+                "capacity",
+                "capacity_is_estimated",
+                "capacity_source",
+            ]
+        )
     starts = trips.rename(columns={"start_station_id": "station_id", "start_station_name": "station_name",
                                    "start_lat": "lat", "start_lon": "lon"})
     ends = trips.rename(columns={"end_station_id": "station_id", "end_station_name": "station_name",
                                  "end_lat": "lat", "end_lon": "lon"})
     stations = pd.concat([starts[["station_id", "station_name", "lat", "lon"]],
                           ends[["station_id", "station_name", "lat", "lon"]]])
-    stations = stations.dropna(subset=["station_id", "lat", "lon"])
+    stations["lat"] = pd.to_numeric(stations["lat"], errors="coerce")
+    stations["lon"] = pd.to_numeric(stations["lon"], errors="coerce")
+    valid_coordinates = (
+        np.isfinite(stations[["lat", "lon"]].to_numpy(dtype=float, na_value=np.nan)).all(axis=1)
+        & stations["lat"].between(-90, 90).to_numpy()
+        & stations["lon"].between(-180, 180).to_numpy()
+    )
+    stations = stations.loc[valid_coordinates].dropna(subset=["station_id"]).copy()
+    if stations.empty:
+        return pd.DataFrame(
+            columns=[
+                "station_id",
+                "station_name",
+                "lat",
+                "lon",
+                "capacity",
+                "capacity_is_estimated",
+                "capacity_source",
+            ]
+        )
     stations = (
         stations.groupby("station_id", as_index=False)
         .agg(
@@ -93,7 +189,19 @@ def build_station_metadata(trips: pd.DataFrame) -> pd.DataFrame:
     )
     stations["station_id"] = stations["station_id"].astype("int32")
     stations["capacity"] = 25
-    return stations[["station_id", "station_name", "lat", "lon", "capacity"]]
+    stations["capacity_is_estimated"] = True
+    stations["capacity_source"] = "estimated_default"
+    return stations[
+        [
+            "station_id",
+            "station_name",
+            "lat",
+            "lon",
+            "capacity",
+            "capacity_is_estimated",
+            "capacity_source",
+        ]
+    ]
 
 
 def aggregate_hourly(trips: pd.DataFrame, station_metadata: pd.DataFrame | None = None) -> pd.DataFrame:
@@ -132,11 +240,15 @@ def process_and_build_parquet_grid(
     input_directory: str | Path,
     output_directory: str | Path,
     input_parquet: str | Path | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, int]]:
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, object]]:
     """Run UC02 cleaning, station metadata extraction, and hourly zero filling."""
-    output_path = Path(output_directory)
+    output_path = Path(output_directory).expanduser().resolve()
     full_parquet = output_path / "uc1_trips_deduplicated.parquet"
-    input_path = Path(input_parquet) if input_parquet is not None else full_parquet
+    input_path = (
+        Path(input_parquet).expanduser().resolve()
+        if input_parquet is not None
+        else full_parquet
+    )
     if full_parquet.exists():
         input_path = full_parquet
 
@@ -156,9 +268,34 @@ def process_and_build_parquet_grid(
             connection.execute("SET memory_limit='80%'")
             connection.execute(f"SET threads={max(1, min(8, os.cpu_count() or 4))}")
             connection.execute("SET preserve_insertion_order=false")
+            source_columns = {
+                str(column[0])
+                for column in connection.execute(
+                    f"DESCRIBE SELECT * FROM read_parquet({sql_path(input_path)})"
+                ).fetchall()
+            }
+            required_columns = {
+                "tripduration",
+                "starttime",
+                "stoptime",
+                "start station id",
+                "start station name",
+                "start station latitude",
+                "start station longitude",
+                "end station id",
+                "end station name",
+                "end station latitude",
+                "end station longitude",
+            }
+            missing_columns = required_columns.difference(source_columns)
+            if missing_columns:
+                raise ValueError(
+                    "Parquet UC02 thiếu cột bắt buộc: "
+                    + ", ".join(sorted(missing_columns))
+                )
             connection.execute(
                 f"""
-                CREATE OR REPLACE TEMP TABLE cleaned_trips AS
+                CREATE OR REPLACE TEMP TABLE uc2_typed_trips AS
                 SELECT
                     try_cast(tripduration AS INTEGER) AS tripduration,
                     try_cast(starttime AS TIMESTAMP) AS starttime,
@@ -172,28 +309,109 @@ def process_and_build_parquet_grid(
                     try_cast("end station latitude" AS DOUBLE) AS "end station latitude",
                     try_cast("end station longitude" AS DOUBLE) AS "end station longitude"
                 FROM read_parquet({sql_path(input_path)})
-                WHERE tripduration BETWEEN 60 AND 7200
-                  AND starttime IS NOT NULL
-                  AND stoptime IS NOT NULL
-                  AND try_cast("start station id" AS INTEGER) IS NOT NULL
-                  AND try_cast("end station id" AS INTEGER) IS NOT NULL
-                  AND NOT (
-                      try_cast("start station id" AS INTEGER)
-                      = try_cast("end station id" AS INTEGER)
-                      AND tripduration < 180
-                  )
-                  AND stoptime > starttime
-                GROUP BY ALL
                 """
             )
             source_rows = int(
                 connection.execute(
-                    f"SELECT count(*) FROM read_parquet({sql_path(input_path)})"
+                    "SELECT count(*) FROM uc2_typed_trips"
                 ).fetchone()[0]
+            )
+            audit_counts = connection.execute(
+                """
+                SELECT
+                    count(*) FILTER (
+                        WHERE starttime IS NOT NULL AND stoptime IS NOT NULL
+                    ) AS valid_timestamps,
+                    count(*) FILTER (
+                        WHERE starttime IS NOT NULL AND stoptime IS NOT NULL
+                          AND "start station id" IS NOT NULL
+                          AND "end station id" IS NOT NULL
+                    ) AS valid_station_ids,
+                    count(*) FILTER (
+                        WHERE starttime IS NOT NULL AND stoptime IS NOT NULL
+                          AND "start station id" IS NOT NULL
+                          AND "end station id" IS NOT NULL
+                          AND "start station latitude" BETWEEN -90 AND 90
+                          AND "end station latitude" BETWEEN -90 AND 90
+                          AND "start station longitude" BETWEEN -180 AND 180
+                          AND "end station longitude" BETWEEN -180 AND 180
+                    ) AS valid_coordinates,
+                    count(*) FILTER (
+                        WHERE starttime IS NOT NULL AND stoptime IS NOT NULL
+                          AND "start station id" IS NOT NULL
+                          AND "end station id" IS NOT NULL
+                          AND "start station latitude" BETWEEN -90 AND 90
+                          AND "end station latitude" BETWEEN -90 AND 90
+                          AND "start station longitude" BETWEEN -180 AND 180
+                          AND "end station longitude" BETWEEN -180 AND 180
+                          AND stoptime > starttime
+                    ) AS valid_time_order,
+                    count(*) FILTER (
+                        WHERE starttime IS NOT NULL AND stoptime IS NOT NULL
+                          AND "start station id" IS NOT NULL
+                          AND "end station id" IS NOT NULL
+                          AND "start station latitude" BETWEEN -90 AND 90
+                          AND "end station latitude" BETWEEN -90 AND 90
+                          AND "start station longitude" BETWEEN -180 AND 180
+                          AND "end station longitude" BETWEEN -180 AND 180
+                          AND stoptime > starttime
+                          AND tripduration BETWEEN 60 AND 7200
+                    ) AS valid_duration,
+                    count(*) FILTER (
+                        WHERE starttime IS NOT NULL AND stoptime IS NOT NULL
+                          AND "start station id" IS NOT NULL
+                          AND "end station id" IS NOT NULL
+                          AND "start station latitude" BETWEEN -90 AND 90
+                          AND "end station latitude" BETWEEN -90 AND 90
+                          AND "start station longitude" BETWEEN -180 AND 180
+                          AND "end station longitude" BETWEEN -180 AND 180
+                          AND stoptime > starttime
+                          AND tripduration BETWEEN 60 AND 7200
+                          AND NOT (
+                              "start station id" = "end station id"
+                              AND tripduration < 180
+                          )
+                    ) AS valid_station_visits
+                FROM uc2_typed_trips
+                """
+            ).fetchone()
+            (
+                valid_timestamps,
+                valid_station_ids,
+                valid_coordinates,
+                valid_time_order,
+                valid_duration,
+                valid_station_visits,
+            ) = (int(value) for value in audit_counts)
+            connection.execute(
+                """
+                CREATE OR REPLACE TEMP TABLE cleaned_trips AS
+                SELECT DISTINCT *
+                FROM uc2_typed_trips
+                WHERE starttime IS NOT NULL
+                  AND stoptime IS NOT NULL
+                  AND "start station id" IS NOT NULL
+                  AND "end station id" IS NOT NULL
+                  AND "start station latitude" BETWEEN -90 AND 90
+                  AND "end station latitude" BETWEEN -90 AND 90
+                  AND "start station longitude" BETWEEN -180 AND 180
+                  AND "end station longitude" BETWEEN -180 AND 180
+                  AND stoptime > starttime
+                  AND tripduration BETWEEN 60 AND 7200
+                  AND NOT (
+                      "start station id" = "end station id"
+                      AND tripduration < 180
+                  )
+                """
             )
             clean_rows = int(
                 connection.execute("SELECT count(*) FROM cleaned_trips").fetchone()[0]
             )
+            if clean_rows == 0:
+                raise ValueError(
+                    "Không còn chuyến đi hợp lệ sau khi kiểm tra thời gian, "
+                    "station_id, tọa độ GPS và quy tắc thời lượng."
+                )
             connection.execute(
                 f"""
                 COPY (
@@ -202,7 +420,9 @@ def process_and_build_parquet_grid(
                         any_value(station_name) AS station_name,
                         median(lat) AS lat,
                         median(lon) AS lon,
-                        25 AS capacity
+                        25 AS capacity,
+                        TRUE AS capacity_is_estimated,
+                        'estimated_default' AS capacity_source
                     FROM (
                         SELECT
                             "start station id" AS station_id,
@@ -218,7 +438,6 @@ def process_and_build_parquet_grid(
                             "end station longitude"
                         FROM cleaned_trips
                     )
-                    WHERE lat IS NOT NULL AND lon IS NOT NULL
                     GROUP BY station_id
                 ) TO {sql_path(output_path / "station_metadata.parquet")}
                 (FORMAT PARQUET, COMPRESSION ZSTD)
@@ -288,11 +507,24 @@ def process_and_build_parquet_grid(
                 (FORMAT PARQUET, COMPRESSION ZSTD)
                 """
             )
-            station_hour_rows = int(
-                connection.execute(
-                    f"SELECT count(*) FROM read_parquet({sql_path(output_path / 'station_hour_cleaned.parquet')})"
-                ).fetchone()[0]
-            )
+            grid_stats = connection.execute(
+                f"""
+                SELECT
+                    count(*) AS station_hour_rows,
+                    count(*) FILTER (
+                        WHERE pickups > 0 OR returns > 0
+                    ) AS observed_station_hours,
+                    count(*) FILTER (
+                        WHERE pickups = 0 AND returns = 0
+                    ) AS zero_filled_cells,
+                    min(timestamp) AS t_min,
+                    max(timestamp) AS t_max
+                FROM read_parquet({sql_path(output_path / 'station_hour_cleaned.parquet')})
+                """
+            ).fetchone()
+            station_hour_rows = int(grid_stats[0])
+            observed_station_hours = int(grid_stats[1])
+            zero_filled_cells = int(grid_stats[2])
             preview = connection.execute(
                 f"SELECT * FROM read_parquet({sql_path(output_path / 'station_hour_cleaned.parquet')}) LIMIT 5"
             ).df()
@@ -303,38 +535,67 @@ def process_and_build_parquet_grid(
             connection.close()
         return preview, stations, {
             "source_rows": source_rows,
+            "input_rows": source_rows,
+            "removed_invalid_timestamp": source_rows - valid_timestamps,
+            "removed_missing_station_id": valid_timestamps - valid_station_ids,
+            "removed_invalid_coordinates": valid_station_ids - valid_coordinates,
+            "removed_time_order": valid_coordinates - valid_time_order,
+            "removed_duration": valid_time_order - valid_duration,
+            "removed_same_station_short": valid_duration - valid_station_visits,
+            "removed_duplicate_rows": valid_station_visits - clean_rows,
             "clean_rows": clean_rows,
             "removed_rows": source_rows - clean_rows,
             "station_count": station_count,
             "station_hour_rows": station_hour_rows,
+            "observed_station_hours": observed_station_hours,
+            "zero_filled_cells": zero_filled_cells,
+            "t_min": str(grid_stats[3]),
+            "t_max": str(grid_stats[4]),
+            "capacity": 25,
+            "capacity_estimated": True,
+            "capacity_source": "estimated_default",
         }
 
     from .data_loader import load_trip_data
 
-    trips = load_trip_data(input_directory)
+    trips = load_trip_data(Path(input_directory).expanduser().resolve())
     if trips.empty:
         raise ValueError("Không tìm thấy dữ liệu chuyến đi để thực hiện UC02.")
     source_rows = len(trips)
-    cleaned = clean_trips(trips)
+    cleaned, cleaning_stats = _clean_trips_with_stats(trips)
     if cleaned.empty:
         raise ValueError("Không còn bản ghi hợp lệ sau khi làm sạch UC02.")
     station_metadata = build_station_metadata(cleaned)
     if station_metadata.empty:
         raise ValueError("Không thể tạo metadata trạm từ dữ liệu hợp lệ.")
     hourly = aggregate_hourly(cleaned, station_metadata)
-    save_processed(hourly, station_metadata, str(output_directory))
+    save_processed(hourly, station_metadata, output_path)
+    observed_station_hours = int(
+        (hourly["pickups"].gt(0) | hourly["returns"].gt(0)).sum()
+    )
     return hourly.head(5), station_metadata, {
+        **cleaning_stats,
         "source_rows": source_rows,
         "clean_rows": len(cleaned),
         "removed_rows": source_rows - len(cleaned),
         "station_count": len(station_metadata),
         "station_hour_rows": len(hourly),
+        "observed_station_hours": observed_station_hours,
+        "zero_filled_cells": len(hourly) - observed_station_hours,
+        "t_min": str(hourly["timestamp"].min()),
+        "t_max": str(hourly["timestamp"].max()),
+        "capacity": 25,
+        "capacity_estimated": True,
+        "capacity_source": "estimated_default",
     }
 
 
-def save_processed(hourly: pd.DataFrame, station_metadata: pd.DataFrame, output_dir: str) -> None:
-    from pathlib import Path
-    path = Path(output_dir)
+def save_processed(
+    hourly: pd.DataFrame,
+    station_metadata: pd.DataFrame,
+    output_dir: str | Path,
+) -> None:
+    path = Path(output_dir).expanduser().resolve()
     path.mkdir(parents=True, exist_ok=True)
     for name, frame in (("station_hour_cleaned", hourly), ("station_metadata", station_metadata)):
         try:

@@ -166,8 +166,8 @@ def scan_and_load_unique_csv(
 ) -> tuple[pd.DataFrame, dict[str, int]]:
     """Recursively load unique Citi Bike CSV files for Use Case 1.
 
-    Files are deduplicated by MD5 before loading and rows are deduplicated
-    after concatenation. Invalid or unreadable files are skipped with a log.
+    CSV input is parsed in bounded chunks; rows are deduplicated after
+    normalization and concatenation. Invalid files are skipped with a log.
     """
     base_path = (
         Path(base_directory).expanduser().resolve()
@@ -194,6 +194,8 @@ def scan_and_load_unique_csv(
     frames: list[pd.DataFrame] = []
     batch_frames: list[pd.DataFrame] = []
     batch_size = 8
+    chunk_size = 50_000
+    loaded_rows = 0
 
     if progress_callback is not None:
         progress_callback(0, stats["total"], "Đang chuẩn bị danh sách file CSV...", 0)
@@ -226,9 +228,20 @@ def scan_and_load_unique_csv(
                 progress_callback(processed_files, stats["total"], f"Sai schema: {path.name}", sum(len(frame) for frame in frames))
             continue
 
+        if frames:
+            batch = pd.concat(frames, ignore_index=True, copy=False)
+            frames.clear()
+            before_batch_dedup = len(batch)
+            batch = batch.drop_duplicates(
+                subset=CORE_TRIP_COLUMNS
+            ).reset_index(drop=True)
+            stats["dup_rows"] += before_batch_dedup - len(batch)
+            batch_frames.append(batch)
+            del batch
+        file_batch_start = len(batch_frames)
         try:
             source_columns = list(dict.fromkeys(plan.values()))
-            frame = pd.read_csv(
+            chunks = pd.read_csv(
                 path,
                 usecols=source_columns,
                 dtype={
@@ -243,6 +256,7 @@ def scan_and_load_unique_csv(
                     **({"tripduration": "Int32"} if "tripduration" in plan else {}),
                 },
                 low_memory=False,
+                chunksize=chunk_size,
             )
         except (OSError, UnicodeDecodeError, pd.errors.EmptyDataError, pd.errors.ParserError, ValueError, TypeError, MemoryError) as exc:
             stats["read_errors"] += 1
@@ -252,48 +266,129 @@ def scan_and_load_unique_csv(
                 progress_callback(processed_files, stats["total"], f"File không hợp lệ: {path.name}", sum(len(item) for item in frames))
             continue
 
-        renamed = {
-            source_name: field
-            for field, source_name in plan.items()
-        }
-        frame = frame.rename(columns=renamed)
-        frame["starttime"] = pd.to_datetime(frame["starttime"], errors="coerce")
-        frame["stoptime"] = pd.to_datetime(frame["stoptime"], errors="coerce")
-        if "tripduration" not in frame.columns:
-            frame["tripduration"] = (
-                (frame["stoptime"] - frame["starttime"]).dt.total_seconds().astype("Int64")
-            )
+        file_frames: list[pd.DataFrame] = []
+        file_raw_rows = 0
+        file_duplicate_rows = 0
+        file_chunk_rows = 0
+        file_batch_duplicate_rows = 0
+        try:
+            for chunk in chunks:
+                renamed = {
+                    source_name: field
+                    for field, source_name in plan.items()
+                }
+                frame = chunk.rename(columns=renamed)
+                frame["starttime"] = pd.to_datetime(
+                    frame["starttime"], errors="coerce"
+                )
+                frame["stoptime"] = pd.to_datetime(
+                    frame["stoptime"], errors="coerce"
+                )
+                if "tripduration" not in frame.columns:
+                    frame["tripduration"] = (
+                        (frame["stoptime"] - frame["starttime"])
+                        .dt.total_seconds()
+                        .astype("Int64")
+                    )
 
-        frame["tripduration"] = pd.to_numeric(frame["tripduration"], errors="coerce").astype("Int32")
-        frame["start station id"] = pd.to_numeric(frame["start station id"], errors="coerce").astype("Int32")
-        frame["end station id"] = pd.to_numeric(frame["end station id"], errors="coerce").astype("Int32")
-        frame = frame.dropna(subset=[
-            "tripduration", "starttime", "stoptime",
-            "start station id", "end station id",
-        ])
-
-        missing = [column for column in CORE_TRIP_COLUMNS if column not in frame.columns]
-        if missing or frame.empty:
-            stats["schema_errors"] += 1
+                frame["tripduration"] = pd.to_numeric(
+                    frame["tripduration"], errors="coerce"
+                ).astype("Int32")
+                frame["start station id"] = pd.to_numeric(
+                    frame["start station id"], errors="coerce"
+                ).astype("Int32")
+                frame["end station id"] = pd.to_numeric(
+                    frame["end station id"], errors="coerce"
+                ).astype("Int32")
+                frame = frame.dropna(
+                    subset=[
+                        "tripduration",
+                        "starttime",
+                        "stoptime",
+                        "start station id",
+                        "end station id",
+                    ]
+                )
+                missing = [
+                    column for column in CORE_TRIP_COLUMNS
+                    if column not in frame.columns
+                ]
+                if missing:
+                    raise ValueError(
+                        "Thiếu cột bắt buộc sau chuẩn hóa: "
+                        + ", ".join(missing)
+                    )
+                if frame.empty:
+                    continue
+                for name_column in ("start station name", "end station name"):
+                    frame[name_column] = frame[name_column].astype("string")
+                file_raw_rows += len(frame)
+                before_chunk_dedup = len(frame)
+                frame = frame.drop_duplicates(
+                    subset=CORE_TRIP_COLUMNS
+                ).reset_index(drop=True)
+                file_duplicate_rows += before_chunk_dedup - len(frame)
+                file_chunk_rows += len(frame)
+                file_frames.append(frame[CORE_TRIP_COLUMNS])
+                if len(file_frames) >= batch_size:
+                    batch = pd.concat(
+                        file_frames, ignore_index=True, copy=False
+                    )
+                    file_frames.clear()
+                    before_batch_dedup = len(batch)
+                    batch = batch.drop_duplicates(
+                        subset=CORE_TRIP_COLUMNS
+                    ).reset_index(drop=True)
+                    file_batch_duplicate_rows += before_batch_dedup - len(batch)
+                    batch_frames.append(batch)
+                    del batch
+        except (
+            OSError,
+            UnicodeDecodeError,
+            pd.errors.EmptyDataError,
+            pd.errors.ParserError,
+            ValueError,
+            TypeError,
+            MemoryError,
+        ) as exc:
+            del batch_frames[file_batch_start:]
+            file_frames.clear()
+            stats["read_errors"] += 1
             stats["invalid_files"] += 1
-            logger.warning("Bỏ qua %s vì thiếu cột bắt buộc hoặc không còn bản ghi hợp lệ: %s", path, ", ".join(missing))
+            logger.warning("Bỏ qua file CSV không hợp lệ %s: %s", path, exc)
+            if progress_callback is not None:
+                progress_callback(
+                    processed_files,
+                    stats["total"],
+                    f"File không hợp lệ: {path.name}",
+                    loaded_rows,
+                )
             continue
 
-        for name_column in ("start station name", "end station name"):
-            frame[name_column] = frame[name_column].astype("string")
+        if file_raw_rows == 0:
+            stats["schema_errors"] += 1
+            stats["invalid_files"] += 1
+            logger.warning(
+                "Bỏ qua %s vì không còn bản ghi hợp lệ sau chuẩn hóa.", path
+            )
+            continue
 
-        before_file_dedup = len(frame)
-        frame = frame.drop_duplicates(subset=CORE_TRIP_COLUMNS).reset_index(drop=True)
-        file_dup_rows = before_file_dedup - len(frame)
-        stats["dup_rows"] += file_dup_rows
-        stats["raw_rows"] += before_file_dedup
+        stats["dup_rows"] += file_duplicate_rows + file_batch_duplicate_rows
+        stats["raw_rows"] += file_raw_rows
 
-        frames.append(frame[CORE_TRIP_COLUMNS])
+        frames.extend(file_frames)
+        loaded_rows += file_chunk_rows - file_batch_duplicate_rows
+        file_frames.clear()
         stats["unique"] += 1
         if progress_callback is not None:
-            progress_callback(processed_files, stats["total"], f"Đã nạp: {path.name}", sum(len(item) for item in frames))
+            progress_callback(
+                processed_files,
+                stats["total"],
+                f"Đã nạp: {path.name}",
+                loaded_rows,
+            )
 
-        if len(frames) >= batch_size:
+        if frames:
             batch = pd.concat(frames, ignore_index=True, copy=False)
             frames.clear()
             before_batch_dedup = len(batch)

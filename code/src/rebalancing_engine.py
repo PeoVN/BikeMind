@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from math import asin, cos, floor, isfinite, radians, sin, sqrt
 
 import numpy as np
@@ -25,6 +29,7 @@ _EXPECTED_COLUMNS = [
 ]
 _MAX_COUNT = float(np.nextafter(np.float64(np.iinfo(np.int64).max), 0))
 _PLAN_COLUMNS = [
+    "route_id",
     "route",
     "from_station",
     "from_station_id",
@@ -45,6 +50,49 @@ _LEGACY_PLAN_COLUMNS = [
     "bikes",
     "distance_km",
     "priority",
+]
+_VALID_IMBALANCE_STATUSES = {"Thiếu xe", "Dư xe", "Cân bằng"}
+_INCENTIVE_RECOMMENDATION_COLUMNS = [
+    "recommendation_id",
+    "station_id",
+    "station_name",
+    "forecast_for",
+    "valid_from",
+    "valid_until",
+    "reward_points",
+    "expected_stock",
+    "safe_min_bikes",
+    "forecast_pickups",
+    "forecast_returns",
+    "forecast_pickups_mae",
+    "forecast_returns_mae",
+    "forecast_pickups_wape",
+    "forecast_returns_wape",
+    "is_peak_hour",
+    "is_estimated",
+    "publishable",
+    "not_publishable_reason",
+    "source_summary",
+    "provenance_json",
+]
+_CLEAN_INCENTIVE_EXECUTION_COLUMNS = [
+    "event_id",
+    "recommendation_id",
+    "station_id",
+    "station_name",
+    "status",
+    "reconciliation_status",
+    "executed_at",
+    "bikes_returned",
+    "reward_points",
+    "source",
+    "source_summary",
+    "event_is_estimated",
+    "recommendation_is_estimated",
+    "is_estimated",
+    "updated_at",
+    "imported_at",
+    "provenance_json",
 ]
 
 
@@ -68,6 +116,46 @@ def _validate_truck_capacity(value: int) -> int:
     if not isfinite(capacity) or capacity <= 0 or not capacity.is_integer():
         raise ValueError("truck_capacity phải là số nguyên lớn hơn 0.")
     return int(capacity)
+
+
+def _normalise_station_id(value: object) -> str:
+    if value is None or isinstance(value, (bool, np.bool_)):
+        return ""
+    try:
+        missing = pd.isna(value)
+    except (TypeError, ValueError):
+        missing = False
+    if isinstance(missing, (bool, np.bool_)) and missing:
+        return ""
+    station_id = str(value).strip()
+    if not station_id:
+        return ""
+    if station_id.startswith("+"):
+        station_id = station_id[1:]
+    try:
+        numeric_id = Decimal(station_id)
+    except InvalidOperation:
+        return station_id
+    if not numeric_id.is_finite():
+        return ""
+    if numeric_id == numeric_id.to_integral_value():
+        return str(int(numeric_id))
+    return station_id
+
+
+def _normalise_station_ids(stations: pd.DataFrame) -> pd.DataFrame:
+    result = stations.copy()
+    result["station_id"] = result["station_id"].map(_normalise_station_id)
+    valid_ids = result["station_id"].ne("")
+    duplicated = result.loc[valid_ids, "station_id"].duplicated(keep=False)
+    if duplicated.any():
+        duplicate_ids = sorted(
+            result.loc[valid_ids, "station_id"].loc[duplicated].unique().tolist()
+        )
+        raise ValueError(
+            "Mã trạm bị trùng sau khi chuẩn hóa: " + ", ".join(duplicate_ids[:10])
+        )
+    return result
 
 
 def _numeric_column(
@@ -377,9 +465,22 @@ def _attach_plan_metadata(
         )
     plan.attrs["unmatched_stations"] = unmatched_frame.to_dict("records")
     plan.attrs["summary"] = {
-        "scheduled_bikes": int(plan["bikes"].sum()) if "bikes" in plan else 0,
+        "scheduled_bikes": int(
+            pd.to_numeric(plan["bikes"], errors="coerce").fillna(0).sum()
+        )
+        if "bikes" in plan
+        else 0,
         "route_count": int(len(plan)),
-        "distance_km": float(plan["distance_km"].sum()) if "distance_km" in plan else 0.0,
+        "distance_km": float(
+            pd.to_numeric(plan["distance_km"], errors="coerce").fillna(0).sum()
+        )
+        if "distance_km" in plan
+        else 0.0,
+        "estimated_route_count": int(
+            plan["uses_estimated_data"].map(_is_truthy).sum()
+        )
+        if "uses_estimated_data" in plan
+        else 0,
         "unmatched_station_count": int(len(unmatched_frame)),
         "unmatched_surplus": int(unmatched_frame["remaining_surplus"].sum())
         if "remaining_surplus" in unmatched_frame
@@ -406,19 +507,76 @@ def _pair_imbalances(
         return _attach_plan_metadata(
             pd.DataFrame(columns=columns), [], safety_buffer, truck_capacity
         )
+    required = {
+        "station_id",
+        "station_name",
+        "lat",
+        "lon",
+        "surplus",
+        "deficit",
+        "imbalance_status",
+    }
+    missing = required.difference(inventory.columns)
+    if missing:
+        raise ValueError("Dữ liệu mất cân bằng thiếu cột: " + ", ".join(sorted(missing)))
 
     inventory = inventory.reset_index(drop=True).copy()
     inventory["_row_index"] = np.arange(len(inventory))
+    inventory["surplus"] = pd.to_numeric(inventory["surplus"], errors="coerce")
+    inventory["deficit"] = pd.to_numeric(inventory["deficit"], errors="coerce")
+    inventory["imbalance_status"] = (
+        inventory["imbalance_status"].fillna("").astype(str).str.strip()
+    )
+    surplus_values = inventory["surplus"].to_numpy(dtype=float, na_value=np.nan)
+    deficit_values = inventory["deficit"].to_numpy(dtype=float, na_value=np.nan)
+    valid_quantities = (
+        np.isfinite(surplus_values)
+        & np.isfinite(deficit_values)
+        & (surplus_values >= 0)
+        & (deficit_values >= 0)
+        & (surplus_values == np.floor(surplus_values))
+        & (deficit_values == np.floor(deficit_values))
+        & (surplus_values <= _MAX_COUNT)
+        & (deficit_values <= _MAX_COUNT)
+    )
+    inventory["surplus"] = np.where(valid_quantities, surplus_values, 0).astype(
+        "int64"
+    )
+    inventory["deficit"] = np.where(valid_quantities, deficit_values, 0).astype(
+        "int64"
+    )
+    status_values = inventory["imbalance_status"].to_numpy(dtype=object)
+    valid_status = np.isin(list(status_values), list(_VALID_IMBALANCE_STATUSES))
+    consistent_status = (
+        ((status_values == "Dư xe") & (surplus_values > 0) & (deficit_values == 0))
+        | ((status_values == "Thiếu xe") & (deficit_values > 0) & (surplus_values == 0))
+        | (
+            (status_values == "Cân bằng")
+            & (surplus_values == 0)
+            & (deficit_values == 0)
+        )
+    )
+    valid_status &= valid_quantities & consistent_status
     coordinates_valid = _valid_coordinates(inventory)
     valid_station_ids = (
         coordinates_valid["station_id"].notna()
         & coordinates_valid["station_id"].astype("string").str.strip().ne("")
     )
-    frame = coordinates_valid.loc[valid_station_ids].copy()
+    valid_inventory_rows = pd.Series(valid_status, index=inventory.index)
+    frame = coordinates_valid.loc[
+        valid_station_ids
+        & coordinates_valid["_row_index"].map(valid_inventory_rows).fillna(False)
+    ].copy()
     valid_row_indexes = set(frame["_row_index"].tolist())
-    frame["station_name"] = frame["station_name"].fillna(
-        frame["station_id"]
-    ).astype(str)
+    frame["station_name"] = (
+        frame["station_name"]
+        .fillna("")
+        .astype("string")
+        .str.strip()
+        .replace("", pd.NA)
+        .fillna(frame["station_id"])
+        .astype(str)
+    )
     donors = frame.loc[frame["surplus"] > 0].to_dict("records")
     receivers = (
         frame.loc[frame["deficit"] > 0]
@@ -481,6 +639,7 @@ def _pair_imbalances(
                 }
             )
             if include_route:
+                row["route_id"] = f"R{len(rows) + 1:05d}"
                 row["route"] = f"{donor['station_name']} → {receiver['station_name']}"
             rows.append(row)
             donor["surplus"] -= amount
@@ -501,6 +660,12 @@ def _pair_imbalances(
         station_id = record["station_id"]
         if pd.isna(station_id) or not str(station_id).strip():
             reason = "Thiếu mã trạm"
+        elif row_index not in valid_row_indexes and not valid_status[row_index]:
+            reason = (
+                "Trạng thái mất cân bằng không hợp lệ"
+                if valid_quantities[row_index]
+                else "Số xe dư/thiếu không hợp lệ"
+            )
         elif row_index not in valid_row_indexes:
             reason = "Tọa độ thiếu hoặc không hợp lệ"
         elif residual_surplus > 0:
@@ -535,9 +700,16 @@ def generate_rebalancing_plan(
     truck_capacity: int = 20,
 ) -> pd.DataFrame:
     """Match surplus stations to deficit stations, nearest first."""
+    if not isinstance(stations, pd.DataFrame):
+        raise TypeError("stations phải là pandas.DataFrame.")
+    buffer = _validate_safety_buffer(safety_buffer)
+    truck_capacity = _validate_truck_capacity(truck_capacity)
     if stations.empty:
-        return pd.DataFrame(
-            columns=["from_station", "to_station", "bikes", "distance_km", "priority"]
+        return _attach_plan_metadata(
+            pd.DataFrame(columns=_LEGACY_PLAN_COLUMNS),
+            [],
+            buffer,
+            truck_capacity,
         )
     required = {
         "station_id", "station_name", "lat", "lon", "capacity", "bikes_available"
@@ -545,9 +717,7 @@ def generate_rebalancing_plan(
     missing = required.difference(stations.columns)
     if missing:
         raise ValueError("Dữ liệu trạm thiếu cột: " + ", ".join(sorted(missing)))
-    buffer = _validate_safety_buffer(safety_buffer)
-    truck_capacity = _validate_truck_capacity(truck_capacity)
-    frame = stations.copy()
+    frame = _normalise_station_ids(stations)
     frame["forecast_pickups"] = 0.0
     frame["forecast_returns"] = 0.0
     inventory = calculate_expected_inventory(frame, buffer)
@@ -562,15 +732,565 @@ def run_greedy_rebalancing(
     truck_capacity: int = 20,
 ) -> pd.DataFrame:
     """Plan transfers from forecasted, safely bounded expected stock."""
+    if not isinstance(station_df, pd.DataFrame):
+        raise TypeError("station_df phải là pandas.DataFrame.")
+    buffer = _validate_safety_buffer(buffer_pct)
+    truck_capacity = _validate_truck_capacity(truck_capacity)
     if station_df.empty:
-        return pd.DataFrame(columns=_PLAN_COLUMNS)
+        return _attach_plan_metadata(
+            pd.DataFrame(columns=_PLAN_COLUMNS), [], buffer, truck_capacity
+        )
     required = {"station_id", "station_name", "lat", "lon", "capacity", "bikes_available"}
     missing = required.difference(station_df.columns)
     if missing:
         raise ValueError("Dữ liệu trạm thiếu cột: " + ", ".join(sorted(missing)))
-    buffer = _validate_safety_buffer(buffer_pct)
-    truck_capacity = _validate_truck_capacity(truck_capacity)
-    inventory = calculate_expected_inventory(station_df, buffer)
+    frame = _normalise_station_ids(station_df)
+    inventory = calculate_expected_inventory(frame, buffer)
     return _pair_imbalances(
         inventory, truck_capacity, include_route=True, safety_buffer=buffer
     )
+
+
+def build_incentive_recommendations(
+    projected: pd.DataFrame,
+    forecast_for: object | None = None,
+    now: object | None = None,
+    reward_points: int = 15,
+    validity_minutes: int = 60,
+    max_data_age_minutes: int = 90,
+) -> pd.DataFrame:
+    """Create UC013 candidates from valid next-hour inventory projections."""
+    if not isinstance(projected, pd.DataFrame):
+        raise TypeError("projected phải là pandas.DataFrame.")
+    for name, value in (
+        ("reward_points", reward_points),
+        ("validity_minutes", validity_minutes),
+        ("max_data_age_minutes", max_data_age_minutes),
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value <= 0:
+            raise ValueError(f"{name} phải là số nguyên lớn hơn 0.")
+
+    recommendations = pd.DataFrame(columns=_INCENTIVE_RECOMMENDATION_COLUMNS)
+    stats = {
+        "input_rows": len(projected),
+        "shortage_rows": 0,
+        "candidates": 0,
+        "excluded_invalid": 0,
+        "excluded_duplicate_station_ids": 0,
+    }
+    recommendations.attrs["stats"] = stats
+    if projected.empty:
+        recommendations.attrs["unavailable_reason"] = "Không có dữ liệu dự báo."
+        return recommendations
+
+    required = {
+        "station_id",
+        "station_name",
+        "expected_stock",
+        "safe_min_bikes",
+        "imbalance_status",
+        "data_quality",
+        "forecast_pickups",
+        "forecast_returns",
+        "forecast_updated_at",
+        "forecast_data_updated_at",
+    }
+    missing = required.difference(projected.columns)
+    if missing:
+        recommendations.attrs["unavailable_reason"] = (
+            "Thiếu cột dự báo cần thiết: " + ", ".join(sorted(missing))
+        )
+        return recommendations
+
+    local_timezone = datetime.now().astimezone().tzinfo
+    current_time = pd.Timestamp.now() if now is None else pd.Timestamp(now)
+    if current_time.tzinfo is not None:
+        current_time = current_time.tz_convert(local_timezone).tz_localize(None)
+    current_time = current_time.floor("s")
+    requested_forecast = None
+    if forecast_for is not None:
+        requested_forecast = pd.Timestamp(forecast_for)
+        if requested_forecast.tzinfo is not None:
+            requested_forecast = (
+                requested_forecast.tz_convert(local_timezone).tz_localize(None)
+            )
+
+    frame = projected.copy()
+    frame["station_id"] = frame["station_id"].map(_normalise_station_id)
+    valid_id = frame["station_id"].ne("")
+    duplicate_ids = frame.loc[valid_id, "station_id"].duplicated(keep=False)
+    stats["excluded_duplicate_station_ids"] = int(duplicate_ids.sum())
+    frame = frame.loc[valid_id & ~duplicate_ids].copy()
+    frame["expected_stock"] = pd.to_numeric(frame["expected_stock"], errors="coerce")
+    frame["safe_min_bikes"] = pd.to_numeric(frame["safe_min_bikes"], errors="coerce")
+    frame["forecast_pickups"] = pd.to_numeric(frame["forecast_pickups"], errors="coerce")
+    frame["forecast_returns"] = pd.to_numeric(frame["forecast_returns"], errors="coerce")
+    shortage = (
+        frame["imbalance_status"].eq("Thiếu xe")
+        & frame["data_quality"].eq("Đủ dữ liệu")
+        & frame["expected_stock"].lt(frame["safe_min_bikes"])
+    )
+    stats["shortage_rows"] = int(shortage.sum())
+    candidates: list[dict[str, object]] = []
+
+    flag_columns = (
+        "projection_is_estimated",
+        "inventory_is_estimated",
+        "capacity_is_estimated",
+    )
+
+    def flag_value(value: object) -> bool:
+        if value is None:
+            return False
+        try:
+            missing_value = pd.isna(value)
+        except (TypeError, ValueError):
+            missing_value = False
+        if isinstance(missing_value, (bool, np.bool_)) and missing_value:
+            return False
+        if isinstance(value, str):
+            return value.strip().lower() in {"true", "1", "yes", "y", "có"}
+        return bool(value)
+
+    def finite_optional(row: pd.Series, column: str) -> float | None:
+        if column not in row.index:
+            return None
+        try:
+            number = float(row[column])
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return number if isfinite(number) else None
+
+    def text_value(value: object) -> str:
+        if value is None:
+            return ""
+        try:
+            missing_value = pd.isna(value)
+        except (TypeError, ValueError):
+            missing_value = False
+        if isinstance(missing_value, (bool, np.bool_)) and missing_value:
+            return ""
+        return str(value).strip()
+
+    for _, row in frame.loc[shortage].iterrows():
+        try:
+            expected_stock = float(row["expected_stock"])
+            safe_min_bikes = float(row["safe_min_bikes"])
+            pickups = float(row["forecast_pickups"])
+            returns = float(row["forecast_returns"])
+            target_time = pd.Timestamp(row["forecast_updated_at"])
+            observed_at = pd.Timestamp(row["forecast_data_updated_at"])
+        except (TypeError, ValueError, OverflowError):
+            stats["excluded_invalid"] += 1
+            continue
+        if (
+            not all(isfinite(value) for value in (expected_stock, safe_min_bikes, pickups, returns))
+            or pickups < 0
+            or returns < 0
+            or pd.isna(target_time)
+            or pd.isna(observed_at)
+        ):
+            stats["excluded_invalid"] += 1
+            continue
+        if target_time.tzinfo is not None:
+            target_time = target_time.tz_convert(local_timezone).tz_localize(None)
+        if observed_at.tzinfo is not None:
+            observed_at = observed_at.tz_convert(local_timezone).tz_localize(None)
+        target_time = target_time.floor("s")
+        observed_at = observed_at.floor("s")
+        if requested_forecast is not None and target_time != requested_forecast:
+            stats["excluded_invalid"] += 1
+            continue
+
+        observed_inventory_at = pd.NaT
+        if text_value(row.get("inventory_updated_at", "")):
+            try:
+                observed_inventory_at = pd.Timestamp(row["inventory_updated_at"])
+            except (TypeError, ValueError, OverflowError):
+                observed_inventory_at = pd.NaT
+            if (
+                not pd.isna(observed_inventory_at)
+                and observed_inventory_at.tzinfo is not None
+            ):
+                observed_inventory_at = (
+                    observed_inventory_at.tz_convert(local_timezone).tz_localize(None)
+                )
+        if not pd.isna(observed_inventory_at):
+            observed_inventory_at = observed_inventory_at.floor("s")
+        forecast_age_minutes = (current_time - observed_at).total_seconds() / 60
+        inventory_age_minutes = (
+            (current_time - observed_inventory_at).total_seconds() / 60
+            if not pd.isna(observed_inventory_at)
+            else float("inf")
+        )
+        age_minutes = max(forecast_age_minutes, inventory_age_minutes)
+        in_current_window = (
+            current_time.floor("h")
+            <= target_time
+            <= current_time.floor("h") + pd.Timedelta(hours=1)
+        )
+        not_publishable_reason = ""
+        if pd.isna(observed_inventory_at):
+            not_publishable_reason = "Thiếu mốc cập nhật tồn kho."
+        elif forecast_age_minutes < 0 or inventory_age_minutes < 0:
+            not_publishable_reason = "Mốc dữ liệu nguồn nằm trong tương lai."
+        elif age_minutes > max_data_age_minutes:
+            not_publishable_reason = (
+                f"Dữ liệu nguồn trễ {age_minutes:.0f} phút "
+                f"(giới hạn {max_data_age_minutes} phút)."
+            )
+        elif not in_current_window:
+            not_publishable_reason = "Dự báo không thuộc khung giờ hiện tại/kế tiếp."
+
+        source_fields = {
+            column: text_value(row.get(column, ""))
+            for column in (
+                "inventory_source",
+                "capacity_source",
+                "forecast_pickups_source",
+                "forecast_returns_source",
+            )
+        }
+        source_fields = {
+            key: value or "Không rõ nguồn"
+            for key, value in source_fields.items()
+        }
+        estimated = any(flag_value(row.get(column)) for column in flag_columns)
+        estimated = estimated or any(
+            "ước tính" in value.lower()
+            or "fallback" in value.lower()
+            or value == "Không rõ nguồn"
+            for value in source_fields.values()
+        )
+        source_available = all(
+            source_fields[key] != "Không rõ nguồn"
+            for key in (
+                "inventory_source",
+                "capacity_source",
+                "forecast_pickups_source",
+                "forecast_returns_source",
+            )
+        )
+        if any(
+            "thiếu dữ liệu" in value.lower()
+            or "không đủ dữ liệu" in value.lower()
+            for key, value in source_fields.items()
+            if key.startswith("forecast_")
+        ):
+            stats["excluded_invalid"] += 1
+            continue
+        if not not_publishable_reason and not source_available:
+            not_publishable_reason = "Thiếu provenance của tồn kho hoặc dự báo."
+        publishable = not not_publishable_reason and in_current_window
+
+        station_id = str(row["station_id"])
+        station_name = text_value(row.get("station_name", ""))
+        provenance = {
+            **source_fields,
+            "inventory_updated_at": text_value(row.get("inventory_updated_at", "")),
+            "capacity_updated_at": text_value(row.get("capacity_updated_at", "")),
+            "forecast_data_updated_at": observed_at.isoformat(),
+            "forecast_updated_at": target_time.isoformat(),
+            "data_age_minutes": (
+                round(age_minutes, 2) if isfinite(age_minutes) else None
+            ),
+            "forecast_data_age_minutes": (
+                round(forecast_age_minutes, 2)
+                if isfinite(forecast_age_minutes)
+                else None
+            ),
+            "inventory_data_age_minutes": (
+                round(inventory_age_minutes, 2)
+                if isfinite(inventory_age_minutes)
+                else None
+            ),
+            "forecast_pickups_mae": finite_optional(row, "forecast_pickups_mae"),
+            "forecast_returns_mae": finite_optional(row, "forecast_returns_mae"),
+            "forecast_pickups_wape": finite_optional(row, "forecast_pickups_wape"),
+            "forecast_returns_wape": finite_optional(row, "forecast_returns_wape"),
+            "is_peak_hour": target_time.hour in {7, 8, 9, 17, 18, 19},
+            "weather_data_available": False,
+            "device_data_available": False,
+        }
+        recommendation_id = hashlib.sha256(
+            f"UC013|{station_id}|{target_time.isoformat()}".encode("utf-8")
+        ).hexdigest()
+        candidates.append(
+            {
+                "recommendation_id": recommendation_id,
+                "station_id": station_id,
+                "station_name": station_name,
+                "forecast_for": target_time,
+                "valid_from": current_time,
+                "valid_until": current_time + pd.Timedelta(minutes=validity_minutes),
+                "reward_points": int(reward_points),
+                "expected_stock": expected_stock,
+                "safe_min_bikes": safe_min_bikes,
+                "forecast_pickups": pickups,
+                "forecast_returns": returns,
+                "forecast_pickups_mae": provenance["forecast_pickups_mae"],
+                "forecast_returns_mae": provenance["forecast_returns_mae"],
+                "forecast_pickups_wape": provenance["forecast_pickups_wape"],
+                "forecast_returns_wape": provenance["forecast_returns_wape"],
+                "is_peak_hour": provenance["is_peak_hour"],
+                "is_estimated": estimated,
+                "publishable": publishable,
+                "not_publishable_reason": not_publishable_reason,
+                "source_summary": "; ".join(
+                    f"{key}={value}" for key, value in source_fields.items()
+                ),
+                "provenance_json": json.dumps(
+                    provenance,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                ),
+            }
+        )
+
+    recommendations = pd.DataFrame(
+        candidates, columns=_INCENTIVE_RECOMMENDATION_COLUMNS
+    )
+    recommendations.attrs["stats"] = {
+        **stats,
+        "candidates": len(recommendations),
+        "publishable": int(recommendations["publishable"].sum())
+        if not recommendations.empty
+        else 0,
+    }
+    if recommendations.empty:
+        recommendations.attrs["unavailable_reason"] = (
+            "Không có trạm thiếu xe với dự báo t+1 và dữ liệu nguồn hợp lệ."
+        )
+    return recommendations
+
+
+def clean_incentive_executions(
+    executions: pd.DataFrame,
+    recommendations: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    """Return only uniquely matched, completed, verified UC013 events."""
+    cleaned = pd.DataFrame(columns=_CLEAN_INCENTIVE_EXECUTION_COLUMNS)
+    stats = {
+        "input_records": len(executions) if isinstance(executions, pd.DataFrame) else 0,
+        "duplicate_event_ids": 0,
+        "invalid_identifiers": 0,
+        "unmatched_recommendations": 0,
+        "station_mismatches": 0,
+        "excluded_statuses": 0,
+        "unverified_records": 0,
+        "outside_validity_window": 0,
+        "invalid_execution_values": 0,
+        "included_records": 0,
+    }
+    if not isinstance(executions, pd.DataFrame) or not isinstance(recommendations, pd.DataFrame):
+        return cleaned, stats
+    required_events = {
+        "event_id",
+        "recommendation_id",
+        "station_id",
+        "status",
+        "reconciliation_status",
+        "executed_at",
+        "bikes_returned",
+    }
+    required_recommendations = {
+        "recommendation_id",
+        "station_id",
+        "station_name",
+        "reward_points",
+        "published_at",
+        "valid_until",
+    }
+    if (
+        executions.empty
+        or recommendations.empty
+        or not required_events.issubset(executions.columns)
+        or not required_recommendations.issubset(recommendations.columns)
+    ):
+        return cleaned, stats
+
+    events = executions.copy()
+    events["event_id"] = events["event_id"].fillna("").astype(str).str.strip()
+    events["recommendation_id"] = (
+        events["recommendation_id"].fillna("").astype(str).str.strip()
+    )
+    events["station_id"] = events["station_id"].map(_normalise_station_id)
+    duplicate_ids = events["event_id"].ne("") & events["event_id"].duplicated(keep=False)
+    stats["duplicate_event_ids"] = int(duplicate_ids.sum())
+    valid_identifiers = (
+        events["event_id"].ne("")
+        & events["recommendation_id"].ne("")
+        & events["station_id"].ne("")
+        & ~duplicate_ids
+    )
+    stats["invalid_identifiers"] = int((~valid_identifiers).sum())
+    events = events.loc[valid_identifiers].copy()
+    events["_normalized_status"] = (
+        events["status"].fillna("").astype(str).str.strip().str.lower()
+    )
+    completed = events["_normalized_status"].eq("completed")
+    stats["excluded_statuses"] = int((~completed).sum())
+    events = events.loc[completed].copy()
+    if events.empty:
+        return cleaned, stats
+
+    recs = recommendations.copy()
+    recs["recommendation_id"] = (
+        recs["recommendation_id"].fillna("").astype(str).str.strip()
+    )
+    recs["station_id"] = recs["station_id"].map(_normalise_station_id)
+    if "status" in recs.columns:
+        recs = recs.loc[
+            recs["status"].fillna("").astype(str).str.upper().eq("PUBLISHED")
+        ].copy()
+    if "provenance_json" not in recs.columns:
+        recs["provenance_json"] = "{}"
+    if "source_summary" not in recs.columns:
+        recs["source_summary"] = ""
+    recs["_recommendation_is_estimated"] = recs.get(
+        "is_estimated", pd.Series(pd.NA, index=recs.index)
+    )
+    events["_event_is_estimated"] = events.get(
+        "is_estimated", pd.Series(pd.NA, index=events.index)
+    )
+    duplicate_recommendations = recs["recommendation_id"].duplicated(keep=False)
+    recs = recs.loc[
+        recs["recommendation_id"].ne("") & ~duplicate_recommendations
+    ].copy()
+    recs["_recommendation_station_id"] = recs["station_id"]
+    events = events.merge(
+        recs[
+            [
+                "recommendation_id",
+                "_recommendation_station_id",
+                "station_name",
+                "reward_points",
+                "published_at",
+                "valid_until",
+                "provenance_json",
+                "source_summary",
+                "_recommendation_is_estimated",
+            ]
+        ].drop_duplicates("recommendation_id"),
+        on="recommendation_id",
+        how="left",
+        validate="many_to_one",
+    )
+    unmatched = events["_recommendation_station_id"].isna()
+    stats["unmatched_recommendations"] = int(unmatched.sum())
+    station_mismatch = (
+        ~unmatched
+        & events["station_id"].ne(events["_recommendation_station_id"])
+    )
+    stats["station_mismatches"] = int(station_mismatch.sum())
+    events = events.loc[~unmatched & ~station_mismatch].copy()
+    if events.empty:
+        return cleaned, stats
+
+    verified = (
+        events["reconciliation_status"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .eq("verified")
+    )
+    stats["unverified_records"] = int((~verified).sum())
+    events = events.loc[verified].copy()
+    if events.empty:
+        return cleaned, stats
+
+    events["_executed_at"] = pd.to_datetime(
+        events["executed_at"], errors="coerce", utc=True
+    )
+    events["_published_at"] = pd.to_datetime(
+        events["published_at"], errors="coerce", utc=True
+    )
+    events["_valid_until"] = pd.to_datetime(
+        events["valid_until"], errors="coerce", utc=True
+    )
+    events["_bikes_returned"] = pd.to_numeric(
+        events["bikes_returned"], errors="coerce"
+    )
+    events["_reward_points"] = pd.to_numeric(events["reward_points"], errors="coerce")
+    numeric_valid = (
+        np.isfinite(events["_bikes_returned"])
+        & events["_bikes_returned"].gt(0)
+        & events["_bikes_returned"].mod(1).eq(0)
+        & events["_bikes_returned"].lt(2**63)
+        & np.isfinite(events["_reward_points"])
+        & events["_reward_points"].gt(0)
+        & events["_reward_points"].mod(1).eq(0)
+        & events["_reward_points"].lt(2**63)
+    )
+    time_valid = (
+        events["_executed_at"].notna()
+        & events["_published_at"].notna()
+        & events["_valid_until"].notna()
+        & events["_executed_at"].ge(events["_published_at"])
+        & events["_executed_at"].le(events["_valid_until"])
+    )
+    stats["outside_validity_window"] = int((~time_valid).sum())
+    stats["invalid_execution_values"] = int((~numeric_valid).sum())
+    events = events.loc[time_valid & numeric_valid].copy()
+    if events.empty:
+        return cleaned, stats
+
+    def normalized_flags(values: pd.Series) -> list[object]:
+        normalized_values: list[object] = []
+        for value in values:
+            if value is None or pd.isna(value):
+                normalized_values.append(pd.NA)
+            elif isinstance(value, str):
+                normalized = value.strip().lower()
+                normalized_values.append(
+                    True if normalized in {"true", "1", "yes", "y", "có"}
+                    else False if normalized in {"false", "0", "no", "n", "không"}
+                    else pd.NA
+                )
+            else:
+                normalized_values.append(bool(value))
+        return normalized_values
+
+    event_estimated = normalized_flags(events["_event_is_estimated"])
+    recommendation_estimated = normalized_flags(
+        events["_recommendation_is_estimated"]
+    )
+    estimated_values: list[object] = []
+    for event_flag, recommendation_flag in zip(
+        event_estimated, recommendation_estimated
+    ):
+        if event_flag is True or recommendation_flag is True:
+            estimated_values.append(True)
+        elif pd.isna(event_flag) or pd.isna(recommendation_flag):
+            estimated_values.append(pd.NA)
+        else:
+            estimated_values.append(False)
+
+    cleaned = pd.DataFrame(
+        {
+            "event_id": events["event_id"].astype(str),
+            "recommendation_id": events["recommendation_id"].astype(str),
+            "station_id": events["station_id"].astype(str),
+            "station_name": events["station_name"].fillna("").astype(str),
+            "status": "completed",
+            "reconciliation_status": "verified",
+            "executed_at": events["_executed_at"],
+            "bikes_returned": events["_bikes_returned"].astype("int64"),
+            "reward_points": events["_reward_points"],
+            "source": events.get("source", pd.Series("", index=events.index)).fillna("").astype(str),
+            "source_summary": events["source_summary"].fillna("").astype(str),
+            "event_is_estimated": event_estimated,
+            "recommendation_is_estimated": recommendation_estimated,
+            "is_estimated": estimated_values,
+            "updated_at": events.get("updated_at", pd.Series("", index=events.index)).fillna("").astype(str),
+            "imported_at": events.get("imported_at", pd.Series("", index=events.index)).fillna("").astype(str),
+            "provenance_json": events.get(
+                "provenance_json", pd.Series("{}", index=events.index)
+            ).fillna("{}").astype(str),
+        },
+        columns=_CLEAN_INCENTIVE_EXECUTION_COLUMNS,
+    ).reset_index(drop=True)
+    stats["included_records"] = len(cleaned)
+    return cleaned, stats
